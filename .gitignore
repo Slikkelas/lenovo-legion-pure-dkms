@@ -1,0 +1,17 @@
+# Compiled Object files
+*.o
+*.ko
+*.obj
+*.mod
+*.mod.c
+
+# Kernel build trash
+modules.order
+Module.symvers
+.tmp_versions/
+.*.cmd
+.*.d
+
+# OS generated files
+.DS_Store
+.Trash-*
