@@ -94,14 +94,6 @@ int legion_rapl_sysfs_init(const struct device *parent)
 
 	mutex_init(&data->rapl_private.lock);
 	
-	/* Check if intel-rapl sysfs exists */
-	struct file *file = filp_open(RAPL_SYSFS_BASE "/name", O_RDONLY, 0);
-	if (IS_ERR(file)) {
-		return (int)PTR_ERR(file);
-	}
-	filp_close(file, NULL);
-
-
 	return 0;
 }
 
