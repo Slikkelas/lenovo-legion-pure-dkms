@@ -26,6 +26,12 @@
 
 #define LEGION_WMI_LENOVO_OTHER_METHOD_GUID "DC2A8805-3A8C-41BA-A6F7-092E0089CD3B"
 
+// Added by Slikkelas
+static bool lock_mmio = false;
+module_param(lock_mmio, bool, 0444);
+MODULE_PARM_DESC(lock_mmio, "Permanently lock MMIO power limits to MSR values on boot (default: N)");
+//
+
 static BLOCKING_NOTIFIER_HEAD(legion_other_chain_head);
 
 static const struct wmi_device_id legion_wmi_other_id_table[] = {
@@ -160,109 +166,135 @@ static int legion_wmi_other_call(struct notifier_block *nb,const unsigned long a
 
 static int legion_wmi_other_dkms_call(struct notifier_block *nb,const unsigned long action, void *data)
 {
-	const struct legion_wmi_other_priv *priv 	  = container_of(nb, struct legion_wmi_other_priv, dkms_nb);
-	struct other_events_data * event_data = data;
+    const struct legion_wmi_other_priv *priv       = container_of(nb, struct legion_wmi_other_priv, dkms_nb);
+    struct other_events_data * event_data = data;
 
-	unsigned int pl1_w 	 = 0,
-				 pl1_time_s = 0,
-				 pl2_w 	 = 0;
+    unsigned int pl1_w      = 0,
+                 pl1_time_s = 0,
+                 pl2_w      = 0;
 
-	if(action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO)
-	{
-		struct legion_wmi_capdata01 capdata;
-		struct legion_wmi_ddata     lddata[48] = {{0,0}};
-
-		if (legion_wmi_cd01_get_data(priv->cd01_list,(CPULongTermPowerLimit  & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
-			return NOTIFY_BAD;
-		}
-		pl1_w = capdata.max_value;
-
-
-		if (legion_wmi_cd01_get_data(priv->cd01_list,(CPUShortTermPowerLimit & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
-			return NOTIFY_BAD;
-		}
-		pl2_w = capdata.max_value;
-
-
-		if (legion_wmi_dd_get_data(priv->dd_list,(CPUPL1Tau & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), lddata,sizeof(lddata)/sizeof(lddata[0]) - 1)) {
-
-			if (legion_wmi_cd01_get_data(priv->cd01_list,(CPUPL1Tau & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
-				return NOTIFY_BAD;
-			}
-
-			pl1_time_s = capdata.default_value;
-		}
-		else
-		{
-			pl1_time_s = 0;
-			for(int i = 0;i < (sizeof(lddata)/sizeof(lddata[0])) && lddata[i].id != 0;++i)
-			{
-				pl1_time_s = max(pl1_time_s,lddata[i].value);
-			}
-		}
-
-		if(legion_set_power_and_time_sysfs(event_data->rapl_private, pl1_w * 1000000, pl1_time_s * 1000000, pl2_w * 1000000))
-		{
-			return NOTIFY_BAD;
-		}
-	}
+    // --- CUSTOM LOCK BEHAVIOR ---
+    if (lock_mmio) 
+    {
+        if(action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO ||
+           action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_MMIO_ONLY)
+        {
+            unsigned int msr_pl1_uw = 0;
+            unsigned int msr_pl2_uw = 0;
+            unsigned int msr_pl1_time_us = 0;
+            unsigned int msr_pl2_time_us = 24400;
+ 
+            // Read pristine MSR values before Lenovo's profile touches them
+            legion_pl1_power_sysfs_read(event_data->rapl_private, &msr_pl1_uw);
+            legion_pl2_power_sysfs_read(event_data->rapl_private, &msr_pl2_uw);
+            legion_pl1_time_sysfs_read(event_data->rapl_private, &msr_pl1_time_us);
+ 
+            if(legion_set_power_and_time_lock(event_data->rapl_mmio_private, 
+                                              msr_pl1_uw / 1000, 
+                                              msr_pl1_time_us, 
+                                              msr_pl2_uw / 1000, 
+                                              msr_pl2_time_us))
+            {
+                return NOTIFY_BAD;
+            }
+        }
+        // Return immediately so we skip all stock Lenovo profile throttling
+        return NOTIFY_OK; 
+    }
 
 
-	if(action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO ||
-	   action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_MMIO_ONLY
-	   )
-	{
-		if(event_data->mode == LEGION_WMI_GZ_THERMAL_MODE_CUSTOM)
-		{
-			struct wmi_method_args_32 args;
+    // --- STOCK BEHAVIOR FOR EVERYONE ELSE ---
+    if(action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO)
+    {
+        struct legion_wmi_capdata01 capdata;
+        struct legion_wmi_ddata     lddata[48] = {{0,0}};
 
-			args.arg0 = CPULongTermPowerLimit  & (~LEGION_WMI_MODE_ID_MASK);
-			if(legion_wmi_dev_evaluate_int(priv->wdev, 0x0, LEGION_WMI_OTHER_FEATURE_VALUE_GET,(unsigned char *)&args, sizeof(args),&pl1_w))
-			{
-				return NOTIFY_BAD;
-			}
+        if (legion_wmi_cd01_get_data(priv->cd01_list,(CPULongTermPowerLimit  & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
+            return NOTIFY_BAD;
+        }
+        pl1_w = capdata.max_value;
 
-			args.arg0 = CPUShortTermPowerLimit  & (~LEGION_WMI_MODE_ID_MASK);
-			if(legion_wmi_dev_evaluate_int(priv->wdev, 0x0, LEGION_WMI_OTHER_FEATURE_VALUE_GET,(unsigned char *)&args, sizeof(args),&pl2_w))
-			{
-				return NOTIFY_BAD;
-			}
+        if (legion_wmi_cd01_get_data(priv->cd01_list,(CPUShortTermPowerLimit & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
+            return NOTIFY_BAD;
+        }
+        pl2_w = capdata.max_value;
 
-			args.arg0 = CPUPL1Tau  & (~LEGION_WMI_MODE_ID_MASK);
-			if(legion_wmi_dev_evaluate_int(priv->wdev, 0x0, LEGION_WMI_OTHER_FEATURE_VALUE_GET,(unsigned char *)&args, sizeof(args),&pl1_time_s))
-			{
-				return NOTIFY_BAD;
-			}
-		}
-		else
-		{
-			struct legion_wmi_capdata01 capdata;
+        if (legion_wmi_dd_get_data(priv->dd_list,(CPUPL1Tau & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), lddata,sizeof(lddata)/sizeof(lddata[0]) - 1)) {
 
-			if (legion_wmi_cd01_get_data(priv->cd01_list,(CPULongTermPowerLimit  & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
-				return NOTIFY_BAD;
-			}
-			pl1_w = capdata.default_value;
+            if (legion_wmi_cd01_get_data(priv->cd01_list,(CPUPL1Tau & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
+                return NOTIFY_BAD;
+            }
+
+            pl1_time_s = capdata.default_value;
+        }
+        else
+        {
+            pl1_time_s = 0;
+            for(int i = 0;i < (sizeof(lddata)/sizeof(lddata[0])) && lddata[i].id != 0;++i)
+            {
+                pl1_time_s = max(pl1_time_s,lddata[i].value);
+            }
+        }
+
+        if(legion_set_power_and_time_sysfs(event_data->rapl_private, pl1_w * 1000000, pl1_time_s * 1000000, pl2_w * 1000000))
+        {
+            return NOTIFY_BAD;
+        }
+    }
 
 
-			if (legion_wmi_cd01_get_data(priv->cd01_list,(CPUShortTermPowerLimit & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
-				return NOTIFY_BAD;
-			}
-			pl2_w = capdata.default_value;
+    if(action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO ||
+       action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_MMIO_ONLY)
+    {
+        if(event_data->mode == LEGION_WMI_GZ_THERMAL_MODE_CUSTOM)
+        {
+            struct wmi_method_args_32 args;
 
-			if (legion_wmi_cd01_get_data(priv->cd01_list,(CPUPL1Tau & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
-				return NOTIFY_BAD;
-			}
-			pl1_time_s = capdata.default_value;
-		}
+            args.arg0 = CPULongTermPowerLimit  & (~LEGION_WMI_MODE_ID_MASK);
+            if(legion_wmi_dev_evaluate_int(priv->wdev, 0x0, LEGION_WMI_OTHER_FEATURE_VALUE_GET,(unsigned char *)&args, sizeof(args),&pl1_w))
+            {
+                return NOTIFY_BAD;
+            }
 
-		if(legion_set_power_and_time(event_data->rapl_mmio_private,pl1_w * 1000,pl1_time_s * 1000000,pl2_w * 1000))
-		{
-			return NOTIFY_BAD;
-		}
+            args.arg0 = CPUShortTermPowerLimit  & (~LEGION_WMI_MODE_ID_MASK);
+            if(legion_wmi_dev_evaluate_int(priv->wdev, 0x0, LEGION_WMI_OTHER_FEATURE_VALUE_GET,(unsigned char *)&args, sizeof(args),&pl2_w))
+            {
+                return NOTIFY_BAD;
+            }
 
-	}
+            args.arg0 = CPUPL1Tau  & (~LEGION_WMI_MODE_ID_MASK);
+            if(legion_wmi_dev_evaluate_int(priv->wdev, 0x0, LEGION_WMI_OTHER_FEATURE_VALUE_GET,(unsigned char *)&args, sizeof(args),&pl1_time_s))
+            {
+                return NOTIFY_BAD;
+            }
+        }
+        else
+        {
+            struct legion_wmi_capdata01 capdata;
 
-	return NOTIFY_OK;
+            if (legion_wmi_cd01_get_data(priv->cd01_list,(CPULongTermPowerLimit  & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
+                return NOTIFY_BAD;
+            }
+            pl1_w = capdata.default_value;
+
+            if (legion_wmi_cd01_get_data(priv->cd01_list,(CPUShortTermPowerLimit & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
+                return NOTIFY_BAD;
+            }
+            pl2_w = capdata.default_value;
+
+            if (legion_wmi_cd01_get_data(priv->cd01_list,(CPUPL1Tau & (~LEGION_WMI_MODE_ID_MASK)) | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, event_data->mode), &capdata)) {
+                return NOTIFY_BAD;
+            }
+            pl1_time_s = capdata.default_value;
+        }
+
+        if(legion_set_power_and_time(event_data->rapl_mmio_private,pl1_w * 1000,pl1_time_s * 1000000,pl2_w * 1000))
+        {
+            return NOTIFY_BAD;
+        }
+    }
+
+    return NOTIFY_OK;
 }
 
 /**
