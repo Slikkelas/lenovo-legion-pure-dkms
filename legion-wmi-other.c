@@ -4,6 +4,9 @@
  *
  * Author(s):
  *   Jaroslav Bolek <jaroslav.bolek@gmail.com>
+ * 
+ * Modified:
+ *	 Slikkelas <149332939+Slikkelas@users.noreply.github.com>
  */
 #include "legion-wmi-other.h"
 #include "legion-wmi-capdata01.h"
@@ -163,7 +166,7 @@ static int legion_wmi_other_call(struct notifier_block *nb,const unsigned long a
 	return NOTIFY_DONE;
 }
 
-
+// Modified by Slikkelas
 static int legion_wmi_other_dkms_call(struct notifier_block *nb,const unsigned long action, void *data)
 {
     const struct legion_wmi_other_priv *priv       = container_of(nb, struct legion_wmi_other_priv, dkms_nb);
@@ -173,35 +176,56 @@ static int legion_wmi_other_dkms_call(struct notifier_block *nb,const unsigned l
                  pl1_time_s = 0,
                  pl2_w      = 0;
 
-    // --- CUSTOM LOCK BEHAVIOR ---
+    // Added by Slikkelas
     if (lock_mmio) 
     {
         if(action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO ||
            action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_MMIO_ONLY)
         {
-            unsigned int msr_pl1_uw = 0;
-            unsigned int msr_pl2_uw = 0;
-            unsigned int msr_pl1_time_us = 0;
-            unsigned int msr_pl2_time_us = 24400;
+            u32 msr_low = 0, msr_high = 0;
+            u64 msr_val = 0;
  
-            // Read pristine MSR values before Lenovo's profile touches them
-            legion_pl1_power_sysfs_read(event_data->rapl_private, &msr_pl1_uw);
-            legion_pl2_power_sysfs_read(event_data->rapl_private, &msr_pl2_uw);
-            legion_pl1_time_sysfs_read(event_data->rapl_private, &msr_pl1_time_us);
- 
-            if(legion_set_power_and_time_lock(event_data->rapl_mmio_private, 
-                                              msr_pl1_uw / 1000, 
-                                              msr_pl1_time_us, 
-                                              msr_pl2_uw / 1000, 
-                                              msr_pl2_time_us))
+            // 0x610 is MSR_PKG_POWER_LIMIT. Read it directly from the CPU.
+            if (rdmsr_safe(0x610, &msr_low, &msr_high) == 0) 
             {
+                msr_val = ((u64)msr_high << 32) | msr_low;
+                
+                // Extract Power Limits (Bits 0-14 and Bits 32-46)
+                // Multiply by 1000 for milliwatts, divide by 8 (POWER_UNIT_DIVISOR)
+                unsigned int pl1_mw = ((msr_val & 0x7FFF) * 1000) / 8;
+                unsigned int pl2_mw = (((msr_val >> 32) & 0x7FFF) * 1000) / 8;
+                
+                // Extract Time Windows (Bits 17-23 and Bits 49-55)
+                unsigned int pl1_time_enc = (msr_val >> 17) & 0x7F;
+                unsigned int pl2_time_enc = (msr_val >> 49) & 0x7F;
+
+                // Decode PL1 Time Window
+                unsigned int f1 = (pl1_time_enc & 0x60) >> 5;
+                unsigned int y1 = pl1_time_enc & 0x1F;
+                unsigned int pl1_time_us = (unsigned int)((((1ULL << y1) * (4 + f1) * 1000000ULL / 4) >> 10));
+
+                // Decode PL2 Time Window
+                unsigned int f2 = (pl2_time_enc & 0x60) >> 5;
+                unsigned int y2 = pl2_time_enc & 0x1F;
+                unsigned int pl2_time_us = (unsigned int)((((1ULL << y2) * (4 + f2) * 1000000ULL / 4) >> 10));
+ 
+                // Write the exact MSR values to MMIO and lock it
+                if(legion_set_power_and_time_lock(event_data->rapl_mmio_private, 
+                                                  pl1_mw, pl1_time_us, 
+                                                  pl2_mw, pl2_time_us))
+                {
+                    return NOTIFY_BAD;
+                }
+            } 
+            else 
+            {
+                pr_err("lenovo-legion: Failed to read MSR 0x610!\n");
                 return NOTIFY_BAD;
             }
         }
         // Return immediately so we skip all stock Lenovo profile throttling
         return NOTIFY_OK; 
     }
-
 
     // --- STOCK BEHAVIOR FOR EVERYONE ELSE ---
     if(action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO)
@@ -241,7 +265,6 @@ static int legion_wmi_other_dkms_call(struct notifier_block *nb,const unsigned l
             return NOTIFY_BAD;
         }
     }
-
 
     if(action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO ||
        action == LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_MMIO_ONLY)
