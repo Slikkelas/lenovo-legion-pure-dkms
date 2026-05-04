@@ -253,7 +253,9 @@ static ssize_t legion_wmi_attr_current_value_store(struct kobject *kobj,
 
 	struct wmi_method_args_32 args;
 	struct legion_wmi_capdata01 capdata;
-	enum thermal_mode mode;
+	// Deleted by Slikkelas
+	//** enum thermal_mode mode;
+	// end
 	char event_type[64] = {0};
 	char event_value[64] = {0};
 	char *envp[] = { event_type, event_value ,NULL };

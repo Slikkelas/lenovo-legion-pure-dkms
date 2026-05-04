@@ -387,8 +387,10 @@ err_wmi_cd00:
 	legion_wmi_gamezone_driver_exit();
 	// end
 err_wmi_gamezone:
-	machine_information_sysfs_exit(data);
-err_machine_information_sysfs:
+// Deleted by Slikkelas
+//**	machine_information_sysfs_exit(data);
+//** err_machine_information_sysfs:
+// end
 err_model_mismatach:
 	legion_data_exit(data);
 err_legion_init:

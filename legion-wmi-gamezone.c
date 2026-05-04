@@ -244,29 +244,29 @@ static int legion_wmi_gz_thermal_mode_set(struct wmi_device *wdev,const enum the
  *
  * Return: notifier_block status.
  */
-static int legion_wmi_gz_event_call(struct notifier_block *nb,const unsigned long cmd,
-			      void *data)
-{
-	struct lenovo_wmi_gz_priv *priv = container_of(nb, struct lenovo_wmi_gz_priv, event_nb);
+// Deleted by Slikkelas
+//** static int legion_wmi_gz_event_call(struct notifier_block *nb,const unsigned long cmd,
+//**			      void *data)
+//** {
+//**	struct lenovo_wmi_gz_priv *priv = container_of(nb, struct lenovo_wmi_gz_priv, event_nb);
 
-	// Modified by Slikkelas
-	switch (cmd) {
-		case LEGION_WMI_EVENT_THERMAL_MODE:
-		{
-			legion_modify_current_mode(priv,*(enum thermal_mode *)data);
-			return NOTIFY_OK;
-		}
-		case LEGION_WMI_EVENT_POWER_CHARGE_MODE:
-		{
-			scoped_guard(spinlock, &priv->gz_mode_lock) {
-				priv->current_adapter_status = *(enum power_adapter_status *)data;
-			}
-			return NOTIFY_OK;
-		}
-		default:
-			return NOTIFY_DONE;
-	}
-}
+//**	switch (cmd) {
+//**		case LEGION_WMI_EVENT_THERMAL_MODE:
+//**		{
+//**			legion_modify_current_mode(priv,*(enum thermal_mode *)data);
+//**			return NOTIFY_OK;
+//**		}
+//**		case LEGION_WMI_EVENT_POWER_CHARGE_MODE:
+//**		{
+//**			scoped_guard(spinlock, &priv->gz_mode_lock) {
+//**				priv->current_adapter_status = *(enum power_adapter_status *)data;
+//**			}
+//**			return NOTIFY_OK;
+//**		}
+//**		default:
+//**			return NOTIFY_DONE;
+//**	}
+//** }
 	// end
 
 
