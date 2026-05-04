@@ -135,6 +135,9 @@ static ssize_t func_fan_curve_current_value_set(struct kobject *kobj, struct kob
 		const char *buf, const size_t count)
 {
 	const struct legion_wmi_fm_priv *priv = dev_get_drvdata(kobj_to_dev(kobj->parent));
+	// Added by Slikkelas
+	ssize_t ret = 0;
+	// end
 	u8 points[20]  		 = {0};
 	u8 buffer[0x20] 	 = {0};
 	char event_value[64] = {0};

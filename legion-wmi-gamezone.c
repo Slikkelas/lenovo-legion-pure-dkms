@@ -266,6 +266,7 @@ static int legion_wmi_gz_event_call(struct notifier_block *nb,const unsigned lon
 		default:
 			return NOTIFY_DONE;
 	}
+}
 	// end
 
 

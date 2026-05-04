@@ -259,6 +259,9 @@ static ssize_t legion_wmi_attr_current_value_store(struct kobject *kobj,
 	char *envp[] = { event_type, event_value ,NULL };
 
 	u32 value = 0;
+	// Added by Slikkelas
+	int ret = 0;
+	// end
 // Deleted by Slikkelas
 //**	int ret = legion_wmi_other_notifier_call(&mode,LEGION_WMI_GZ_GET_THERMAL_MODE);
 //**	if (ret)

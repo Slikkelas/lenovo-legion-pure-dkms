@@ -147,16 +147,17 @@ static int legion_probe(struct platform_device *pdev)
 
     print_machine_information(&pdev->dev,&data->machine_info);
 
+// Deleted by Slikkelas
     /*
      * Sysfs Machine information
      */
-    err = machine_information_sysfs_init(data);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create Sysfs Machine information: %d\n", err);
-		goto err_machine_information_sysfs;
-	}
-	dev_info(&pdev->dev,"\tSysfs Machine information was initialized \n");
-
+//**    err = machine_information_sysfs_init(data);
+//**	if (err) {
+//**		dev_err(&pdev->dev, "\tFailed to create Sysfs Machine information: %d\n", err);
+//**		goto err_machine_information_sysfs;
+//**	}
+//**	dev_info(&pdev->dev,"\tSysfs Machine information was initialized \n");
+// end
 
     /*
      * WMI gamezone
@@ -438,10 +439,10 @@ static void legion_remove(struct platform_device *pdev)
 // Deleted by Slikkelas
     //** legion_wmi_events_driver_exit();
     //** dev_info(&pdev->dev, "\tWMI events driver was unregistered \n");
-// end
-    machine_information_sysfs_exit(data);
-    dev_info(&pdev->dev, "\tSysfs Machine information was unregistered \n");
 
+    //** machine_information_sysfs_exit(data);
+    //** dev_info(&pdev->dev, "\tSysfs Machine information was unregistered \n");
+// end
     legion_data_exit(data);
     dev_info(&pdev->dev, "\tLegion data structure was unregistered \n");
 
