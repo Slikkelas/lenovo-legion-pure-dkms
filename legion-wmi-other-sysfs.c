@@ -259,14 +259,14 @@ static ssize_t legion_wmi_attr_current_value_store(struct kobject *kobj,
 	char *envp[] = { event_type, event_value ,NULL };
 
 	u32 value = 0;
+// Deleted by Slikkelas
+//**	int ret = legion_wmi_other_notifier_call(&mode,LEGION_WMI_GZ_GET_THERMAL_MODE);
+//**	if (ret)
+//**		return ret;
 
-	int ret = legion_wmi_other_notifier_call(&mode,LEGION_WMI_GZ_GET_THERMAL_MODE);
-	if (ret)
-		return ret;
-
-	if (mode != LEGION_WMI_GZ_THERMAL_MODE_CUSTOM)
-		return -EBUSY;
-
+//**	if (mode != LEGION_WMI_GZ_THERMAL_MODE_CUSTOM)
+//**		return -EBUSY;
+// end
 
 	ret = legion_wmi_cd01_get_data(priv->cd01_list,  attribute_id_raw | FIELD_PREP(LEGION_WMI_MODE_ID_MASK, LEGION_WMI_GZ_THERMAL_MODE_CUSTOM), &capdata);
 	if (ret)

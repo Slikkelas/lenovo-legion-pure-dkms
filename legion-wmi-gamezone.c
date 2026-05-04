@@ -7,7 +7,6 @@
  */
 #include "legion-common.h"
 #include "legion-wmi-gamezone.h"
-#include "legion-wmi-events.h"
 #include "legion-wmi-helpers.h"
 #include "legion-wmi-gamezone-sysfs.h"
 #include "legion-wmi-other.h"
@@ -250,240 +249,26 @@ static int legion_wmi_gz_event_call(struct notifier_block *nb,const unsigned lon
 {
 	struct lenovo_wmi_gz_priv *priv = container_of(nb, struct lenovo_wmi_gz_priv, event_nb);
 
+	// Modified by Slikkelas
 	switch (cmd) {
-	case LEGION_WMI_EVENT_THERMAL_MODE:
-	{
-		legion_modify_current_mode(priv,*(enum thermal_mode *)data);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-		platform_profile_notify(priv->ppdev);
-#else
-		platform_profile_notify();
-#endif
-		return NOTIFY_OK;
-	}
-	case LEGION_WMI_EVENT_POWER_CHARGE_MODE:
-	{
-		/* Just update the adapter status and notify user space.
-		 * Do NOT call WMI methods from within event callbacks as this
-		 * can cause deadlocks or freezes. The thermal mode will be
-		 * applied when user space requests a profile change.
-		 */
-		scoped_guard(spinlock, &priv->gz_mode_lock) {
-			priv->current_adapter_status = *(enum power_adapter_status *)data;
-		}
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-		platform_profile_notify(priv->ppdev);
-#else
-		platform_profile_notify();
-#endif
-		return NOTIFY_OK;
-	}
-	default:
-		return NOTIFY_DONE;
-	}
-}
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-
-/**
- * legion_wmi_gz_profile_get() - Get the current platform profile.
- * @dev: the Gamezone interface parent device.
- * @profile: Pointer to provide the current platform profile with.
- *
- * Call lwmi_gz_thermal_mode_get and convert the thermal mode into a platform
- * profile based on the support level of the interface.
- *
- * Return: 0 on success, or an error code.
- */
-static int legion_wmi_gz_profile_get(struct device *dev,enum platform_profile_option *profile)
-{
-	switch (legion_current_mode(dev_get_drvdata(dev))) {
-	case LEGION_WMI_GZ_THERMAL_MODE_QUIET:
-		*profile = PLATFORM_PROFILE_QUIET;
-		break;
-	case LEGION_WMI_GZ_THERMAL_MODE_BALANCED:
-		*profile = PLATFORM_PROFILE_BALANCED;
-		break;
-	case LEGION_WMI_GZ_THERMAL_MODE_PERFORMANCE:
-		*profile = PLATFORM_PROFILE_PERFORMANCE;
-		break;
-	case LEGION_WMI_GZ_THERMAL_MODE_EXTREME:
-		*profile = PLATFORM_PROFILE_BALANCED_PERFORMANCE;
-		break;
-	case LEGION_WMI_GZ_THERMAL_MODE_CUSTOM:
-		*profile = PLATFORM_PROFILE_CUSTOM;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-/**
- * legion_wmi_gz_profile_set() - Set the current platform profile.
- * @dev: The Gamezone interface parent device.
- * @profile: Pointer to the desired platform profile.
- *
- * Convert the given platform profile into a thermal mode based on the support
- * level of the interface, then call the WMI method to set the thermal mode.
- *
- * Return: 0 on success, or an error code.
- */
-static int legion_wmi_gz_profile_set(struct device *dev,enum platform_profile_option profile)
-{
-	struct lenovo_wmi_gz_priv *priv = dev_get_drvdata(dev);
-	enum thermal_mode mode = LEGION_WMI_GZ_THERMAL_MODE_BALANCED;
-
-	switch (profile) {
-	case PLATFORM_PROFILE_QUIET:
-		mode = LEGION_WMI_GZ_THERMAL_MODE_QUIET;
-		break;
-	case PLATFORM_PROFILE_BALANCED:
-		mode = LEGION_WMI_GZ_THERMAL_MODE_BALANCED;
-		break;
-	case PLATFORM_PROFILE_PERFORMANCE:
-		if(legion_is_ac_connected(priv->current_adapter_status))
+		case LEGION_WMI_EVENT_THERMAL_MODE:
 		{
-			mode = LEGION_WMI_GZ_THERMAL_MODE_PERFORMANCE;
+			legion_modify_current_mode(priv,*(enum thermal_mode *)data);
+			return NOTIFY_OK;
 		}
-		else
+		case LEGION_WMI_EVENT_POWER_CHARGE_MODE:
 		{
-			mode = LEGION_WMI_GZ_THERMAL_MODE_BALANCED;
+			scoped_guard(spinlock, &priv->gz_mode_lock) {
+				priv->current_adapter_status = *(enum power_adapter_status *)data;
+			}
+			return NOTIFY_OK;
 		}
-		break;
-	default:
-		return -EOPNOTSUPP;
+		default:
+			return NOTIFY_DONE;
 	}
-
-	const int ret = legion_wmi_gz_thermal_mode_set(priv->wdev,mode);
-	if (ret)
-		return ret;
-
-	legion_modify_current_mode(priv,mode);
-
-	return 0;
-}
+	// end
 
 
-/**
- * legion_wmi_gz_platform_profile_probe - Enable and set up the platform profile
- * device.
- * @drvdata: Driver data for the interface.
- * @choices: Container for enabled platform profiles.
- *
- * Determine if thermal mode is supported, and if so to what feature level.
- * Then enable all supported platform profiles.
- *
- * Return: 0 on success, or an error code.
- */
-static int legion_wmi_gz_platform_profile_probe(void *drvdata, unsigned long *choices)
-{
-	set_bit(PLATFORM_PROFILE_QUIET,choices);
-	set_bit(PLATFORM_PROFILE_BALANCED, choices);
-	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
-
-	return 0;
-}
-
-
-/**
- * legion_wmi_gz_platform_profile_hidden_choices - Enable and set up the platform profile
- * device.
- * @drvdata: Driver data for the interface.
- * @choices: Container for enabled platform profiles.
- *
- * Determine if thermal mode is supported, and if so to what feature level.
- * Then enable all supported platform profiles.
- *
- * Return: 0 on success, or an error code.
- */
-static int legion_wmi_gz_platform_profile_hidden_choices(void *drvdata, unsigned long *choices)
-{
-	const struct lenovo_wmi_gz_priv *priv = drvdata;
-
-	set_bit(PLATFORM_PROFILE_CUSTOM, choices);
-	if (priv->extreme_supported)
-		set_bit(PLATFORM_PROFILE_BALANCED_PERFORMANCE, choices);
-
-	return 0;
-}
-
-static const struct platform_profile_ops legion_wmi_gz_platform_profile_ops = {
-	.probe = legion_wmi_gz_platform_profile_probe,
-	.hidden_choices = legion_wmi_gz_platform_profile_hidden_choices,
-	.profile_get = legion_wmi_gz_profile_get,
-	.profile_set = legion_wmi_gz_profile_set
-};
-#else
-
-static int legion_wmi_gz_profile_get(struct platform_profile_handler *pprof,
-				       enum platform_profile_option *profile)
-{
-
-	switch (legion_current_mode(container_of(pprof, struct lenovo_wmi_gz_priv, platform_profile_handler))) {
-	case LEGION_WMI_GZ_THERMAL_MODE_QUIET:
-		*profile = PLATFORM_PROFILE_QUIET;
-		break;
-	case LEGION_WMI_GZ_THERMAL_MODE_BALANCED:
-		*profile = PLATFORM_PROFILE_BALANCED;
-		break;
-	case LEGION_WMI_GZ_THERMAL_MODE_PERFORMANCE:
-		*profile = PLATFORM_PROFILE_PERFORMANCE;
-		break;
-	case LEGION_WMI_GZ_THERMAL_MODE_EXTREME:
-		*profile = PLATFORM_PROFILE_BALANCED_PERFORMANCE;
-		break;
-	case LEGION_WMI_GZ_THERMAL_MODE_CUSTOM:
-		*profile = PLATFORM_PROFILE_BALANCED_PERFORMANCE;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int legion_wmi_gz_profile_set(struct platform_profile_handler *pprof,
-				       enum platform_profile_option profile)
-{
-
-	struct lenovo_wmi_gz_priv *priv = container_of(pprof, struct lenovo_wmi_gz_priv, platform_profile_handler);
-	enum thermal_mode mode;
-	int ret;
-
-	switch (profile) {
-	case PLATFORM_PROFILE_QUIET:
-		mode = LEGION_WMI_GZ_THERMAL_MODE_QUIET;
-		break;
-	case PLATFORM_PROFILE_BALANCED:
-		mode = LEGION_WMI_GZ_THERMAL_MODE_BALANCED;
-		break;
-	case PLATFORM_PROFILE_PERFORMANCE:
-		if(legion_is_ac_connected(priv->current_adapter_status))
-		{
-			mode = LEGION_WMI_GZ_THERMAL_MODE_PERFORMANCE;
-		}
-		else
-		{
-			mode = LEGION_WMI_GZ_THERMAL_MODE_BALANCED;
-		}
-		break;
-	default:
-		return -EOPNOTSUPP;
-	}
-
-	ret = legion_wmi_gz_thermal_mode_set(priv->wdev,mode);
-	if (ret)
-		return ret;
-
-	legion_modify_current_mode(priv,mode);
-
-	return 0;
-}
-
-#endif
 
 static int legion_wmi_read_static_values(struct wmi_device *wdev,struct game_zone_preloaded_method_values* cache)
 {
@@ -554,53 +339,37 @@ static int legion_wmi_gz_probe(struct wmi_device *wdev, const void *context)
 
 	priv->extreme_supported = legion_wmi_gz_extreme_supported(priv->preloaded_values.IsSupportSmartFan);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-	priv->ppdev = devm_platform_profile_register(&wdev->dev, "lenovo-wmi-gamezone",
-						     priv, &legion_wmi_gz_platform_profile_ops);
-	if (IS_ERR(priv->ppdev)) {
-		dev_err(&wdev->dev, "Failed to register platform profile\n");
-		return (int)PTR_ERR(priv->ppdev);
-	}
-#else
-	priv->platform_profile_handler.profile_get = legion_wmi_gz_profile_get;
-	priv->platform_profile_handler.profile_set = legion_wmi_gz_profile_set;
-
-	set_bit(PLATFORM_PROFILE_QUIET, priv->platform_profile_handler.choices);
-	set_bit(PLATFORM_PROFILE_BALANCED,priv->platform_profile_handler.choices);
-	set_bit(PLATFORM_PROFILE_BALANCED_PERFORMANCE,priv->platform_profile_handler.choices);
-	set_bit(PLATFORM_PROFILE_PERFORMANCE,priv->platform_profile_handler.choices);
-
-	ret = platform_profile_register(&priv->platform_profile_handler);
-	if (ret)
-		return ret;
-#endif
-
-	priv->event_nb.notifier_call = legion_wmi_gz_event_call;
-	ret = devm_legion_wmi_events_register_notifier(&wdev->dev, &priv->event_nb);
-	if (ret)
-		goto err_unregister_platform_profile;
+	// Modified by Slikkelas
+	// Deleting event_nb block because legion-wmi-events is not present
+	// and are letting ideapad_laptop handle the ACPI events natively.
+	//** priv->event_nb.notifier_call = legion_wmi_gz_event_call;
+	//** ret = devm_legion_wmi_events_register_notifier(&wdev->dev, &priv->event_nb);
+	//** if (ret)
+	//**	return ret;
 
 	priv->other_nb.notifier_call = legion_wmi_other_gz_call;
 	ret = devm_lenovo_wmi_other_register_notifier(&wdev->dev, &priv->other_nb);
 	if (ret)
-		goto err_unregister_platform_profile;
+		return ret;
 
 	priv->fm_nb.notifier_call = legion_wmi_fm_gz_call;
 	ret = devm_lenovo_wmi_fm_register_notifier(&wdev->dev, &priv->fm_nb);
 	if (ret)
-		goto err_unregister_platform_profile;
+		return ret;
 
 	ret = legion_wmi_gamezone_sysfs_init(priv);
 	if (ret)
-		goto err_unregister_platform_profile;
+		return ret;
 
 	return 0;
-
-err_unregister_platform_profile:
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
-	platform_profile_remove();
-#endif
-	return ret;
+// Modified by Slikkelas
+	// Deleting
+//** err_unregister_platform_profile:
+//** #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
+//**	platform_profile_remove();
+//** #endif
+//**	return ret;
+	// end
 }
 
 static const struct wmi_device_id legion_wmi_gz_id_table[] = {
@@ -615,11 +384,12 @@ static void legion_wmi_gz_remove(struct wmi_device *wdev)
 	
 	/* Remove sysfs first before devres cleanup */
 	legion_wmi_gamezone_sysfs_exit(priv);
-	
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
+// Modified by Slikkelas
+// Deleted because driver no longer owns a platform profile.
+//** #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
 	/* Unregister platform profile for older kernels (not devres-managed) */
-	platform_profile_remove();
-#endif
+//** 	platform_profile_remove();
+//** #endif
 	/* For kernels >= 6.14.0, platform profile device is automatically cleaned up by devres */
 }
 

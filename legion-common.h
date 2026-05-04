@@ -9,27 +9,28 @@
 #ifndef LEGION_COMMON_H
 #define LEGION_COMMON_H
 
+// Deleted by Slikkelas
+//** #include "legion-machine-information-sysfs.h"
+// end
 #include "legion-wmi-ddata.h"
 #include "legion-wmi-ftable.h"
 #include "legion-machine-information.h"
-#include "legion-machine-information-sysfs.h"
 #include "legion-intel-msr-sysfs.h"
 #include "legion-intel-msr.h"
 #include "legion-rapl.h"
+#include "legion-rapl-mmio.h"
 
 #include <linux/device.h>
 #include <linux/version.h>
 
-#include "legion-rapl-mmio.h"
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-
 struct legion_data {
     struct mutex   						   		mutex;
     struct machine_information             		machine_info;
-    struct machine_information_sysfs_private	machine_info_sysfs_private;
+	// Deleted by Slikkelas
+    //** struct machine_information_sysfs_private	machine_info_sysfs_private;
+	// end
 
-    /*
+	/*
      * EC SysFs
      */
     int 										ec_ida_id;
@@ -53,65 +54,26 @@ struct legion_data {
     struct legion_intel_msr_sysfs_private      intel_msr_sysfs_private;
     struct legion_intel_msr_private            intel_msr_private;
 
-
+// Deleted by Slikkelas
     /*
      * Notifier block
      */
-    struct notifier_block 					   nb;
+//**    struct notifier_block 					   nb;
+// end
 
     /*
      * HWMon device
      */
     struct device						   	   *hwmon_dev;
 
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
+
     /*
      * Component master bound flag
      */
     bool component_master_bound;
-};
-
-#else
-
-struct legion_data {
-    struct mutex   						   				mutex;
-    struct machine_information             				machine_info;
-    struct machine_information_sysfs_private			machine_info_sysfs_private;
-
-    /*
-     * EC SysFs
-     */
-    int 												ec_ida_id;
-	struct device 							   		   *ec_fw_attr_dev;
-	struct kset   							  		   *ec_fw_attr_kset;
-
-    /*
-     * Rapl
-     */
-    struct legion_rapl_private				  			rapl_private;
-
-	/*
-	 * Rapl MMIO
-	 */
-    struct legion_rapl_mmio_private      	   			rapl_mmio_private;
-
-    /*
-     * Notifier block
-     */
-    struct notifier_block 					   nb;
-
-	/*
-	 * Intel MSR
-	 */
-    struct legion_intel_msr_sysfs_private      intel_msr_sysfs_private;
-    struct legion_intel_msr_private            intel_msr_private;
-
-    /*
-     * HWMon device
-     */
-    struct device						  			   *hwmon_dev;
-};
-
 #endif
+};
 
 
 enum legion_events_type {

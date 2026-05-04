@@ -8,7 +8,6 @@
 #include "legion-dkms.h"
 #include "legion-common.h"
 #include "legion-compatibility.h"
-#include "legion-wmi-events.h"
 #include "legion-wmi-gamezone.h"
 #include "legion-wmi-capdata00.h"
 #include "legion-wmi-capdata01.h"
@@ -73,48 +72,31 @@ static int legion_dkms_notifier_call(void *data,enum other_events_type other_eve
 	return 0;
 }
 
-
-static int legion_wmi_gz_event_call_for_rapl(struct notifier_block *nb, unsigned long cmd,void *data)
+// Modified by Slikkelas
+/*
+ * Queries the Lenovo Embedded Controller for the factory default limits
+ * (typically Balanced mode) and applies them to the MMIO/RAPL registers.
+ */
+static void legion_apply_boot_rapl_limits(struct legion_data *priv, bool use_rapl)
 {
-	if (cmd == LEGION_WMI_EVENT_THERMAL_MODE)
-	{
-		struct legion_data *priv = container_of(nb, struct legion_data, nb);
+	/*
+	 * DEFAULT_THERMAL_MODE is defined as Balanced (0x02).
+	 * If you want a different default boot state, you can change this
+	 * to LEGION_WMI_GZ_THERMAL_MODE_QUIET or PERFORMANCE.
+	 */
+	struct other_events_data event_data = {
+		DEFAULT_THERMAL_MODE,
+		&priv->rapl_mmio_private,
+		&priv->rapl_private
+	};
 
-		struct other_events_data  event_data = {
-				(*(enum thermal_mode *)(data)),
-				&priv->rapl_mmio_private,
-				&priv->rapl_private
-		};
-
-
-		legion_dkms_notifier_call(&event_data,LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO);
-
-		return NOTIFY_OK;
+	if (use_rapl) {
+		legion_dkms_notifier_call(&event_data, LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO);
+	} else {
+		legion_dkms_notifier_call(&event_data, LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_MMIO_ONLY);
 	}
-
-	return NOTIFY_DONE;
 }
-
-static int legion_wmi_gz_event_call_for_rapl_mmio(struct notifier_block *nb, unsigned long cmd,void *data)
-{
-	if (cmd == LEGION_WMI_EVENT_THERMAL_MODE)
-	{
-		struct legion_data *priv = container_of(nb, struct legion_data, nb);
-
-		struct other_events_data  event_data = {
-				(*(enum thermal_mode *)(data)),
-				&priv->rapl_mmio_private,
-				&priv->rapl_private
-		};
-
-		legion_dkms_notifier_call(&event_data,LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_MMIO_ONLY);
-
-		return NOTIFY_OK;
-	}
-
-	return NOTIFY_DONE;
-}
-
+// end
 
 static int legion_pm_resume(struct device *dev)
 {
@@ -186,16 +168,16 @@ static int legion_probe(struct platform_device *pdev)
 	}
 	dev_info(&pdev->dev,"\tWMI game zone driver was initialized \n");
 
-
+// Deleted by Slikkelas
     /*
      * WMI events
      */
-    err = legion_wmi_events_driver_init(&pdev->dev);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create WMI events driver: %d\n", err);
-		goto err_wmi_events;
-	}
-	dev_info(&pdev->dev,"\tWMI events driver was initialized \n");
+//**    err = legion_wmi_events_driver_init(&pdev->dev);
+//**	if (err) {
+//**		dev_err(&pdev->dev, "\tFailed to create WMI events driver: %d\n", err);
+//**		goto err_wmi_events;
+//**	}
+//**	dev_info(&pdev->dev,"\tWMI events driver was initialized \n");
 
 
     /*
@@ -316,46 +298,61 @@ static int legion_probe(struct platform_device *pdev)
 		goto post_init_err;
 	}
 
+	// Modified by Slikkelas
 	/*
 	 * Lock the RAPL MMIO = > using RAPL
 	 */
-	if(is_rapl_enabled)
-	{
-		if(!is_rapl_mmio_locked)
-		{
-			dev_info(&pdev->dev,"\tRAPL and RAPL MMIO synchronization \n");
+	//** if(is_rapl_enabled)
+	//** {
+	//** 	if(!is_rapl_mmio_locked)
+	//** 	{
+	//**		dev_info(&pdev->dev,"\tRAPL and RAPL MMIO synchronization \n");
+	//**
+	//**		data->nb.notifier_call = legion_wmi_gz_event_call_for_rapl;
 
-			data->nb.notifier_call = legion_wmi_gz_event_call_for_rapl;
+	//**        struct other_events_data  event_data = {
+	//**		DEFAULT_THERMAL_MODE,
+	//**				&data->rapl_mmio_private,
+	//**				&data->rapl_private
+	//**		};
 
-			struct other_events_data  event_data = {
-					DEFAULT_THERMAL_MODE,
-					&data->rapl_mmio_private,
-					&data->rapl_private
-			};
+			//**  legion_dkms_notifier_call(&event_data,LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO);
+		//** }
+	//** } else
+	//** {
+	//**	dev_info(&pdev->dev,"\tRAPL MMIO synchronization only \n");
 
-			legion_dkms_notifier_call(&event_data,LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO);
-		}
-	} else
-	{
-		dev_info(&pdev->dev,"\tRAPL MMIO synchronization only \n");
+	//**	data->nb.notifier_call = legion_wmi_gz_event_call_for_rapl_mmio;
 
-		data->nb.notifier_call = legion_wmi_gz_event_call_for_rapl_mmio;
+	//**	struct other_events_data  event_data = {
+	//**			DEFAULT_THERMAL_MODE,
+	//**			&data->rapl_mmio_private,
+	//**			&data->rapl_private
+	//**	};
 
-		struct other_events_data  event_data = {
-				DEFAULT_THERMAL_MODE,
-				&data->rapl_mmio_private,
-				&data->rapl_private
-		};
+		//** legion_dkms_notifier_call(&event_data,LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_MMIO_ONLY);
+	//** }
 
-		legion_dkms_notifier_call(&event_data,LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_MMIO_ONLY);
+	//** err = devm_legion_wmi_events_register_notifier(&pdev->dev, &data->nb);
+	//** if (err){
+	//**	dev_err(&pdev->dev, "\tLegion platform post initialization error ! : %d\n", err);
+	//**	goto post_init_err;
+	//** }
+
+	// Added by Slikkelas
+	/*
+	 * Fetch and apply the default factory power limits from the EC.
+	 * This establishes a safe baseline before userspace takes over.
+	 */
+	if (is_rapl_enabled && !is_rapl_mmio_locked) {
+		dev_info(&pdev->dev, "\tApplying factory default limits (RAPL + MMIO sync)\n");
+		legion_apply_boot_rapl_limits(data, true);
+	} else if (!is_rapl_enabled) {
+		dev_info(&pdev->dev, "\tApplying factory default limits (MMIO only)\n");
+		legion_apply_boot_rapl_limits(data, false);
+	} else {
+		dev_info(&pdev->dev, "\tRAPL MMIO is locked by BIOS. Cannot apply limits.\n");
 	}
-
-	err = devm_legion_wmi_events_register_notifier(&pdev->dev, &data->nb);
-	if (err){
-		dev_err(&pdev->dev, "\tLegion platform post initialization error ! : %d\n", err);
-		goto post_init_err;
-	}
-
 
 	dev_info(&pdev->dev,"Legion platform driver was loaded\n");
 	return 0;
@@ -378,10 +375,16 @@ err_wmi_dd:
 	legion_wmi_cd01_driver_exit();
 err_wmi_cd01:
 	legion_wmi_cd00_driver_exit();
+	// Deleted by Slikkelas
+//** err_wmi_cd00:
+//**	legion_wmi_events_driver_exit();
+//** err_wmi_events:
+//**	legion_wmi_gamezone_driver_exit();
+	// end
+// Added by Slikkelas
 err_wmi_cd00:
-	legion_wmi_events_driver_exit();
-err_wmi_events:
 	legion_wmi_gamezone_driver_exit();
+	// end
 err_wmi_gamezone:
 	machine_information_sysfs_exit(data);
 err_machine_information_sysfs:
@@ -432,10 +435,10 @@ static void legion_remove(struct platform_device *pdev)
 
     legion_wmi_gamezone_driver_exit();
     dev_info(&pdev->dev, "\tWMI game zone driver was unregistered \n");
-
-    legion_wmi_events_driver_exit();
-    dev_info(&pdev->dev, "\tWMI events driver was unregistered \n");
-
+// Deleted by Slikkelas
+    //** legion_wmi_events_driver_exit();
+    //** dev_info(&pdev->dev, "\tWMI events driver was unregistered \n");
+// end
     machine_information_sysfs_exit(data);
     dev_info(&pdev->dev, "\tSysfs Machine information was unregistered \n");
 
@@ -465,51 +468,71 @@ static int legion_suspend(struct platform_device *pdev, pm_message_t state)
     return 0;
 }
 
-
+// Deleted by Slikkelas
 /*
  * VPC2004 Virtual power connector
  */
-static const struct acpi_device_id legion_device_ids[] =
-{
-    { "VPC2004", 0 },
-    { "", 0 },
-};
-
+//** static const struct acpi_device_id legion_device_ids[] =
+//** {
+//**    { "VPC2004", 0 },
+//**    { "", 0 },
+//** };
+// end
 
 static struct platform_driver legion_driver = {
-    .probe      = legion_probe,
-    .remove     = legion_remove,
-    .shutdown   = legion_shutdown,
-    .suspend    = legion_suspend,
-    .resume     = legion_resume,
-    .driver = {
-        .name   = "lenovo-legion",
-        .pm     = &legion_pm,
-        .acpi_match_table = ACPI_PTR(legion_device_ids),
+	.probe      = legion_probe,
+	.remove     = legion_remove,
+	.shutdown   = legion_shutdown,
+	.suspend    = legion_suspend,
+	.resume     = legion_resume,
+	.driver = {
+		.name   = "lenovo-legion",
+		.pm     = &legion_pm,
+		// Deleted by Slikkelas to severe ACPI conflict with ideapad_laptop
+		//** .acpi_match_table = ACPI_PTR(legion_device_ids),
+		// end
 		.owner  = THIS_MODULE
-    }
+	}
 };
+
+static struct platform_device *legion_pdev;
 
 static int __init legion_init(void)
 {
-    const int err = platform_driver_register(&legion_driver);
-    if (err) {
-        return err;
-    }
-    return 0;
-}
+	int err;
 
+	err = platform_driver_register(&legion_driver);
+	if (err)
+		return err;
+
+	legion_pdev = platform_device_alloc("lenovo-legion", PLATFORM_DEVID_NONE);
+	if (!legion_pdev) {
+		platform_driver_unregister(&legion_driver);
+		return -ENOMEM;
+	}
+
+	err = platform_device_add(legion_pdev);
+	if (err) {
+		platform_device_put(legion_pdev);
+		platform_driver_unregister(&legion_driver);
+		return err;
+	}
+
+	return 0;
+}
 
 static void __exit legion_exit(void)
 {
-    platform_driver_unregister(&legion_driver);
+	platform_device_unregister(legion_pdev);
+	platform_driver_unregister(&legion_driver);
 }
 
 module_init(legion_init);
 module_exit(legion_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Jaroslav Bolek");
-MODULE_DESCRIPTION("Lenovo Legion Pro 7 16IRX9H DKMS driver");
+MODULE_AUTHOR("Jaroslav Bolek (Modified by Slikkelas)");
+MODULE_DESCRIPTION("Originally: Lenovo Legion Pro 7 16IRX9H DKMS driver. Now: Lenovo Legion Core MSR/RAPL Injector");
 MODULE_VERSION("0.9.10");
-MODULE_DEVICE_TABLE(acpi, legion_device_ids);
+// Deleted by Slikkelas
+//** MODULE_DEVICE_TABLE(acpi, legion_device_ids);

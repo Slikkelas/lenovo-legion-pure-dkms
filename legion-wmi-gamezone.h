@@ -12,7 +12,6 @@
 #include <linux/spinlock.h>
 #include <linux/spinlock_types.h>
 #include <linux/notifier.h>
-#include <linux/platform_profile.h>
 #include <linux/version.h>
 
 
@@ -211,7 +210,8 @@ struct lenovo_wmi_gz_priv {
 	struct notifier_block fm_nb;
 
 	struct wmi_device *wdev;
-	struct device *ppdev;
+	// Removed by Slikkelas to remove the platform profile handlers
+	// struct device *ppdev;
 
 	//SysFs
 	struct device *fw_attr_dev;
@@ -221,9 +221,6 @@ struct lenovo_wmi_gz_priv {
 	struct game_zone_preloaded_method_values preloaded_values; /* Cached value to avoid WMI calls in sysfs */
 
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
-    struct platform_profile_handler 	platform_profile_handler;
-#endif
 
 };
 

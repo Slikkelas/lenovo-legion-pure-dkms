@@ -146,16 +146,18 @@ static ssize_t func_fan_curve_current_value_set(struct kobject *kobj, struct kob
 		NULL
 	};
 
+// Deleted by Slikkelas
+//**	enum thermal_mode 	mode;
+//**	ssize_t ret = legion_wmi_fm_notifier_call(&mode,LEGION_WMI_GZ_GET_THERMAL_MODE);
+//**	if (ret) {
+//**		return ret;
+//**	}
 
-	enum thermal_mode 	mode;
-	ssize_t ret = legion_wmi_fm_notifier_call(&mode,LEGION_WMI_GZ_GET_THERMAL_MODE);
-	if (ret) {
-		return ret;
-	}
+//**	if (mode != LEGION_WMI_GZ_THERMAL_MODE_CUSTOM) {
+//**		return -EBUSY;
+//**	}
+// end
 
-	if (mode != LEGION_WMI_GZ_THERMAL_MODE_CUSTOM) {
-		return -EBUSY;
-	}
 
 	if(sscanf(buf,"%hhu,%hhu,%hhu,%hhu,%hhu,%hhu,%hhu,%hhu,%hhu,%hhu",&points[0],
 																      &points[1],
