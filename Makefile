@@ -8,10 +8,10 @@ MODDEST_DIR := /lib/modules/$(KERNEL_VERSION)/kernel/drivers/platform/x86
 DKMS_DIR := /usr/src/LenovoLegion-$(VERSION)
 
 obj-m := lenovo_legion.o 
-// Deleted from lenovo_legion-objs by Slikkelas
-//** legion-machine-information-sysfs.o
-//** legion-wmi-events.o
-// end
+# Deleted from lenovo_legion-objs by Slikkelas
+#** legion-machine-information-sysfs.o
+#** legion-wmi-events.o
+# end
 lenovo_legion-objs := legion-dkms.o legion-common.o legion-firmware-attributes-class.o \
                       legion-compatibility.o legion-machine-information.o \
                       legion-wmi-helpers.o legion-wmi-gamezone.o legion-wmi-gamezone-sysfs.o \
