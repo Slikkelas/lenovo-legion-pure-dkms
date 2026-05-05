@@ -4,6 +4,8 @@
  *
  * Author(s):
  *   Jaroslav Bolek <jaroslav.bolek@gmail.com>
+ * Modified by:
+ *   Slikkelas
  */
 
 #include "legion-intel-msr.h"
@@ -38,10 +40,14 @@ struct read_msr_data {
  */
 static u32 uv_to_msr(int uv)
 {
+    // Modified by Slikkelas
+    // Conversion to mV instead of µV.
     // Convert mV to 1/1024V units
     // 1mV = 1.024 units of 1/1024V
-    const s32 offset_units = (uv * 1024) / 1000000;
-
+    const s32 offset_units = (uv * 1024) / 1000;
+    // Convert µV to 1/1024V units
+    //** const s32 offset_units = (uv * 1024) / 1000000;
+    // end
     // Handle two's complement for negative values
     // Mask to 21 bits
     return (u32)offset_units & 0x1FFFFF;
@@ -67,9 +73,12 @@ static int msr_to_uv(const u32 msr_value)
         // Positive value
         offset_units = (s32)raw_value;
     }
-
+    // Modified by Slikkelas
+    //** Convert from 1/1024V units to µV
+    //** return (offset_units * 1000000) / 1024;
     // Convert from 1/1024V units to mV
-    return (offset_units * 1000000) / 1024;
+    return (offset_units * 1000) / 1024;
+    // end
 }
 
 
