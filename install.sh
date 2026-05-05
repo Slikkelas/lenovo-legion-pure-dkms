@@ -25,7 +25,11 @@ dkms install -m ${MOD_NAME} -v ${MOD_VERS}
 echo "Setting up auto-load on boot..."
 cp lenovo-legion.conf /etc/modules-load.d/
 
-# 4. Load the module immediately
+# 4. Set default module options
+echo "Generating default modprobe configuration..."
+echo "options lenovo_legion lock_mmio=0" > /etc/modprobe.d/lenovo-legion-lock_mmio.conf
+
+# 5. Load the module immediately
 modprobe lenovo_legion
 
 echo ""
