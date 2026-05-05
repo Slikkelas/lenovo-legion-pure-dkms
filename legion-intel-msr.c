@@ -44,7 +44,7 @@ static u32 uv_to_msr(int uv)
     // Conversion to mV instead of µV.
     // Convert mV to 1/1024V units
     // 1mV = 1.024 units of 1/1024V
-    const s32 offset_units = (uv * 1024) / 1000;
+    const s32 offset_units = DIV_ROUND_CLOSEST(uv * 1024, 1000);
     // Convert µV to 1/1024V units
     //** const s32 offset_units = (uv * 1024) / 1000000;
     // end
@@ -77,7 +77,7 @@ static int msr_to_uv(const u32 msr_value)
     //** Convert from 1/1024V units to µV
     //** return (offset_units * 1000000) / 1024;
     // Convert from 1/1024V units to mV
-    return (offset_units * 1000) / 1024;
+    return DIV_ROUND_CLOSEST(offset_units * 1000, 1024);
     // end
 }
 

@@ -4,6 +4,8 @@
  *
  * Author(s):
  *   Jaroslav Bolek <jaroslav.bolek@gmail.com>
+ * Modified:
+ *   Slikkelas <https://github.com/Slikkelas>
  */
 
 #include "legion-common.h"
@@ -267,7 +269,7 @@ static ssize_t cpu_max_overvolt_show(struct device *dev,struct device_attribute 
 		return -ENODEV;
 	}
 
-    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CPU].max_overvolt_uv);;
+    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CPU].max_overvolt_uv);
 }
 
 
@@ -282,7 +284,7 @@ static ssize_t cache_max_undervolt_show(struct device *dev,struct device_attribu
 		return -ENODEV;
 	}
 
-    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CACHE].max_undervolt_uv);;
+    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CACHE].max_undervolt_uv);
 }
 
 
@@ -297,8 +299,10 @@ static ssize_t cache_max_overvolt_show(struct device *dev,struct device_attribut
 	if (!priv) {
 		return -ENODEV;
 	}
-
-    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CACHE].max_undervolt_uv);;
+// Corrected by Slikkelas
+// Changed .max_undervolt_uv to .max_overvolt_uv
+    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CACHE].max_overvolt_uv);
+// end
 }
 
 
@@ -312,7 +316,7 @@ static ssize_t gpu_max_undervolt_show(struct device *dev,struct device_attribute
 		return -ENODEV;
 	}
 
-    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_GPU].max_undervolt_uv);;
+    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_GPU].max_undervolt_uv);
 }
 
 
@@ -328,7 +332,7 @@ static ssize_t gpu_max_overvolt_show(struct device *dev,struct device_attribute 
 		return -ENODEV;
 	}
 
-    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_GPU].max_undervolt_uv);;
+    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_GPU].max_overvolt_uv);
 }
 
 
@@ -343,7 +347,7 @@ static ssize_t uncore_max_undervolt_show(struct device *dev,struct device_attrib
 		return -ENODEV;
 	}
 
-    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_UNCORE].max_undervolt_uv);;
+    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_UNCORE].max_undervolt_uv);
 }
 
 
@@ -359,7 +363,7 @@ static ssize_t uncore_max_overvolt_show(struct device *dev,struct device_attribu
 		return -ENODEV;
 	}
 
-    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_UNCORE].max_undervolt_uv);;
+    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_UNCORE].max_overvolt_uv);
 }
 
 /*
@@ -429,7 +433,7 @@ static ssize_t analogio_max_undervolt_show(struct device *dev,struct device_attr
 		return -ENODEV;
 	}
 
-    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_ANALOGIO].max_undervolt_uv);;
+    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_ANALOGIO].max_undervolt_uv);
 }
 
 
@@ -445,7 +449,7 @@ static ssize_t analogio_max_overvolt_show(struct device *dev,struct device_attri
 		return -ENODEV;
 	}
 
-    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_ANALOGIO].max_undervolt_uv);;
+    return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_ANALOGIO].max_overvolt_uv);
 }
 
 static DEVICE_ATTR_RW(cpu_offset);

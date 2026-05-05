@@ -73,18 +73,21 @@ static enum thermal_mode  legion_current_mode(const struct lenovo_wmi_gz_priv *p
 	return priv->current_mode_on_battery;
 }
 
-static void legion_modify_current_mode(struct lenovo_wmi_gz_priv *priv,const enum thermal_mode mode)
-{
-	guard(spinlock)(&priv->gz_mode_lock);
+// Deleted by Slikkelas
+// Reason: Letting ideapad_laptop handle the ACPI events natively
+//**	static void legion_modify_current_mode(struct lenovo_wmi_gz_priv *priv,const enum thermal_mode mode)
+//**	{
+//**		guard(spinlock)(&priv->gz_mode_lock);
 
-	if(legion_is_ac_connected(priv->current_adapter_status))
-	{
-		priv->current_mode_on_ac = mode;
-		return;
-	}
+//**		if(legion_is_ac_connected(priv->current_adapter_status))
+//**		{
+//**			priv->current_mode_on_ac = mode;
+//**			return;
+//**		}
 
-	priv->current_mode_on_battery = mode;
-}
+//**		priv->current_mode_on_battery = mode;
+//**	}
+// end
 
 int legion_wmi_gz_get(struct wmi_device *wdev,const enum LEGION_GAMEZONE_METHOD_ID method_id,u32 *value) {
 	return legion_wmi_dev_evaluate_int(wdev, 0x0, method_id,
