@@ -140,7 +140,7 @@ ssize_t legion_intel_msr_apply_pcore_ratio(struct legion_intel_msr_private *inte
 
     guard(mutex)(&intel_msr_private->lock);
     //** on_each_cpu(write_pcore_ratio_on_cpu, &data, 1); // Backop attempt if smp_call doesn't work
-    smp_call_function_single(0, write_pcore_ratio_on_cpu, &data, 1);'
+    smp_call_function_single(0, write_pcore_ratio_on_cpu, &data, 1);
 
     return 0;
 }

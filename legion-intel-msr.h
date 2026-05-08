@@ -19,9 +19,9 @@
 #define PLANE_UNCORE    3
 #define PLANE_ANALOGIO  4
 #define NUM_VOLTAGE_PLANES 5
-// Added by Slikkelas
-#define MSR_TURBO_RATIO_LIMIT 0x1AD
-#define MSR_ATOM_CORE_TURBO_RATIOS 0x66C
+// Added by Slikkelas (Only if needed, but most kernels do have this registers included)
+//** #define MSR_TURBO_RATIO_LIMIT 0x1AD
+//** #define MSR_ATOM_CORE_TURBO_RATIOS 0x66C
 // end
 
 // Modified by Slikkelas
