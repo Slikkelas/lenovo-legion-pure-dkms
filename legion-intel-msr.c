@@ -153,8 +153,8 @@ ssize_t legion_intel_msr_apply_ecore_ratio(struct legion_intel_msr_private *inte
     if (ratio < 8 || ratio > 120) return -EINVAL;
 
     guard(mutex)(&intel_msr_private->lock);
-    //** on_each_cpu(write_ecore_ratio_on_cpu, &data, 1); // Backop attempt if smp_call doesn't work
-    smp_call_function_single(0, write_ecore_ratio_on_cpu, &data, 1);
+    on_each_cpu(write_ecore_ratio_on_cpu, &data, 1); // Backop attempt if smp_call doesn't work
+    //** smp_call_function_single(0, write_ecore_ratio_on_cpu, &data, 1);
 
     return 0;
 }
@@ -167,10 +167,13 @@ static void read_pcore_ratio_on_cpu(void *info)
     u64 *result = info;
     u32 low = 0, high = 0;
 
-    if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
+    if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) 
+    {
         // Read the lowest 8 bits (1-core active limit)
         *result = low & 0xFF; 
-    } else {
+    } 
+    else 
+    {
         *result = 0;
     }
 }
@@ -180,12 +183,15 @@ static void read_ecore_ratio_on_cpu(void *info)
     u64 *result = info;
     u32 low = 0, high = 0;
 
-    if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
+    if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) 
+    {
         // Read the lowest 8 bits (Group 0 limit)
         *result = low & 0xFF; 
-    } else {
-        *result = 0;
-    }
+    } 
+    //** else 
+    //** {
+    //**    *result = 0;
+    //** }
 }
 
 ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
@@ -206,8 +212,15 @@ ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel
     u64 result = 0;
     
     guard(mutex)(&intel_msr_private->lock);
-    smp_call_function_single(0, read_ecore_ratio_on_cpu, &result, 1);
     
+    //** smp_call_function_single(0, read_ecore_ratio_on_cpu, &result, 1);
+    // Loop through online CPUs until it finds an E-Core that answers
+        for_each_online_cpu(cpu) {
+            smp_call_function_single(cpu, read_ecore_ratio_on_cpu, &result, 1);
+            if (result != 0) {
+                break;
+            }
+        }
     if (result == 0) return -EIO;
     
     *ratio = (int)result;
