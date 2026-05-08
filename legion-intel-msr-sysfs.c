@@ -246,7 +246,40 @@ static ssize_t analogio_offset_store(struct device *dev,struct device_attribute 
     return (ssize_t)count;
 }
 
+// Added by Slikkelas
+static ssize_t pcore_all_ratio_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int ratio = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
 
+	if (!priv) return -ENODEV;
+	if (kstrtoint(buf, 10, &ratio)) return -EINVAL;
+
+	ssize_t ret = legion_intel_msr_apply_pcore_ratio(&priv->intel_msr_private, ratio);
+	if (ret < 0) return ret;
+
+	return (ssize_t)count;
+}
+
+static ssize_t ecore_all_ratio_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int ratio = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv) return -ENODEV;
+	if (kstrtoint(buf, 10, &ratio)) return -EINVAL;
+
+	ssize_t ret = legion_intel_msr_apply_ecore_ratio(&priv->intel_msr_private, ratio);
+	if (ret < 0) return ret;
+
+	return (ssize_t)count;
+}
+
+// Write-only attributes for setting the global ratio
+static DEVICE_ATTR_WO(pcore_all_ratio);
+static DEVICE_ATTR_WO(ecore_all_ratio);
+
+// end
 
 static ssize_t cpu_max_undervolt_show(struct device *dev,struct device_attribute *attr, char *buf)
 {
@@ -488,6 +521,10 @@ static struct attribute *legion_intel_msr_sysfs_attributes[]  = {
 	    &dev_attr_gpu_offset.attr,
 	    &dev_attr_uncore_offset.attr,
 	    &dev_attr_analogio_offset.attr,
+		// Added by Slikkelas
+		&dev_attr_pcore_all_ratio.attr,
+		&dev_attr_ecore_all_ratio.attr,
+		// end
 
 	    &dev_attr_cpu_max_undervolt.attr,
 	    &dev_attr_cpu_max_overvolt.attr,

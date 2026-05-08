@@ -101,7 +101,64 @@ static ssize_t validate_offset(const struct legion_intel_msr_private *intel_msr_
     return 0;
 }
 
+// Added by Slikkelas
+/*
+ * Write boost frequency for P- and E-Cores
+ */
+static void write_pcore_ratio_on_cpu(void *info)
+{
+    const u64 ratio = *(u64 *)info;
+    u64 msr_val = 0;
 
+    // Pack the same ratio into all 8 active-core slots (8 bytes)
+    for (int i = 0; i < 8; i++) {
+        msr_val |= (ratio << (i * 8));
+    }
+
+    wrmsr_safe(MSR_TURBO_RATIO_LIMIT, (u32)msr_val, (u32)(msr_val >> 32));
+}
+
+static void write_ecore_ratio_on_cpu(void *info)
+{
+    const u64 ratio = *(u64 *)info;
+    u64 msr_val = 0;
+
+    // Pack the same ratio into all 8 active-core slots (8 bytes)
+    for (int i = 0; i < 8; i++) {
+        msr_val |= (ratio << (i * 8));
+    }
+
+    wrmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, (u32)msr_val, (u32)(msr_val >> 32));
+}
+
+ssize_t legion_intel_msr_apply_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio)
+{
+    u64 data = (u64)ratio;
+
+    // Sanity check to prevent hard locks (Max ratio usually 85x-120x, keep it safe)
+    if (ratio < 8 || ratio > 120) return -EINVAL;
+
+    guard(mutex)(&intel_msr_private->lock);
+    //** on_each_cpu(write_pcore_ratio_on_cpu, &data, 1); // Backop attempt if smp_call doesn't work
+    smp_call_function_single(0, write_pcore_ratio_on_cpu, &data, 1);'
+
+    return 0;
+}
+
+ssize_t legion_intel_msr_apply_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio)
+{
+    u64 data = (u64)ratio;
+
+    // Sanity check to prevent hard locks
+    if (ratio < 8 || ratio > 120) return -EINVAL;
+
+    guard(mutex)(&intel_msr_private->lock);
+    //** on_each_cpu(write_ecore_ratio_on_cpu, &data, 1); // Backop attempt if smp_call doesn't work
+    smp_call_function_single(0, write_ecore_ratio_on_cpu, &data, 1);
+
+    return 0;
+}
+// end
 
 /*
  * Write voltage offset to specific plane on a CPU
