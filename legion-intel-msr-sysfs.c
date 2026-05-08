@@ -247,6 +247,32 @@ static ssize_t analogio_offset_store(struct device *dev,struct device_attribute 
 }
 
 // Added by Slikkelas
+static ssize_t pcore_all_ratio_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    int ratio = 0;
+    struct legion_data *priv = dev_get_drvdata(dev);
+
+    if (!priv) return -ENODEV;
+
+    ssize_t ret = legion_intel_msr_read_pcore_ratio(&priv->intel_msr_private, &ratio);
+    if (ret < 0) return ret;
+
+    return sprintf(buf, "%d\n", ratio);
+}
+
+static ssize_t ecore_all_ratio_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    int ratio = 0;
+    struct legion_data *priv = dev_get_drvdata(dev);
+
+    if (!priv) return -ENODEV;
+
+    ssize_t ret = legion_intel_msr_read_ecore_ratio(&priv->intel_msr_private, &ratio);
+    if (ret < 0) return ret;
+
+    return sprintf(buf, "%d\n", ratio);
+}
+
 static ssize_t pcore_all_ratio_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
 	int ratio = 0;
@@ -276,8 +302,8 @@ static ssize_t ecore_all_ratio_store(struct device *dev, struct device_attribute
 }
 
 // Write-only attributes for setting the global ratio
-static DEVICE_ATTR_WO(pcore_all_ratio);
-static DEVICE_ATTR_WO(ecore_all_ratio);
+static DEVICE_ATTR_RW(pcore_all_ratio);
+static DEVICE_ATTR_RW(ecore_all_ratio);
 
 // end
 

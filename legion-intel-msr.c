@@ -158,6 +158,61 @@ ssize_t legion_intel_msr_apply_ecore_ratio(struct legion_intel_msr_private *inte
 
     return 0;
 }
+
+/*
+ * Read boost frequency for P- and E-Cores
+ */
+static void read_pcore_ratio_on_cpu(void *info)
+{
+    u64 *result = info;
+    u32 low = 0, high = 0;
+
+    if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
+        // Read the lowest 8 bits (1-core active limit)
+        *result = low & 0xFF; 
+    } else {
+        *result = 0;
+    }
+}
+
+static void read_ecore_ratio_on_cpu(void *info)
+{
+    u64 *result = info;
+    u32 low = 0, high = 0;
+
+    if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
+        // Read the lowest 8 bits (Group 0 limit)
+        *result = low & 0xFF; 
+    } else {
+        *result = 0;
+    }
+}
+
+ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
+{
+    u64 result = 0;
+    
+    guard(mutex)(&intel_msr_private->lock);
+    smp_call_function_single(0, read_pcore_ratio_on_cpu, &result, 1);
+    
+    if (result == 0) return -EIO;
+    
+    *ratio = (int)result;
+    return 0;
+}
+
+ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
+{
+    u64 result = 0;
+    
+    guard(mutex)(&intel_msr_private->lock);
+    smp_call_function_single(0, read_ecore_ratio_on_cpu, &result, 1);
+    
+    if (result == 0) return -EIO;
+    
+    *ratio = (int)result;
+    return 0;
+}
 // end
 
 /*

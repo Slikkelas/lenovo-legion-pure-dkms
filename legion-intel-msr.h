@@ -19,7 +19,7 @@
 #define PLANE_UNCORE    3
 #define PLANE_ANALOGIO  4
 #define NUM_VOLTAGE_PLANES 5
-// Added by Slikkelas (Only if needed, but most kernels do have this registers included)
+// Added by Slikkelas (Only if needed, but most kernels do have this registers already included)
 //** #define MSR_TURBO_RATIO_LIMIT 0x1AD
 //** #define MSR_ATOM_CORE_TURBO_RATIOS 0x66C
 // end
@@ -51,6 +51,8 @@ ssize_t  legion_intel_msr_offset_read_show(struct legion_intel_msr_private *inte
 // Added by Slikkelas
 ssize_t legion_intel_msr_apply_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio);
 ssize_t legion_intel_msr_apply_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio);
+ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio);
+ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio);
 // end
 
 int  legion_intel_msr_init(struct legion_intel_msr_private *intel_msr_private);
