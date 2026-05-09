@@ -210,6 +210,7 @@ ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel
 ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
 {
     u64 result = 0;
+    int cpu;
     
     guard(mutex)(&intel_msr_private->lock);
     
