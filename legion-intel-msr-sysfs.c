@@ -247,64 +247,89 @@ static ssize_t analogio_offset_store(struct device *dev,struct device_attribute 
 }
 
 // Added by Slikkelas
-static ssize_t pcore_all_ratio_show(struct device *dev, struct device_attribute *attr, char *buf)
+/* P-Core Active Ratio Table (1C through 8C limits) */
+static ssize_t pcore_active_ratios_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-    int ratio = 0;
+    u64 result = 0;
+    struct legion_data *priv = dev_get_drvdata(dev);
+
+    if (!priv) return -ENODEV;
+    if (legion_intel_msr_read_pcore_active_ratios(&priv->intel_msr_private, &result) < 0) return -EIO;
+
+    u32 low = (u32)result;
+    u32 high = (u32)(result >> 32);
+
+    return sprintf(buf, "%d %d %d %d %d %d %d %d\n",
+                   low & 0xFF, (low >> 8) & 0xFF, (low >> 16) & 0xFF, (low >> 24) & 0xFF,
+                   high & 0xFF, (high >> 8) & 0xFF, (high >> 16) & 0xFF, (high >> 24) & 0xFF);
+}
+
+static ssize_t pcore_active_ratios_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    int r[8] = {0};
+    u64 msr_val = 0;
     struct legion_data *priv = dev_get_drvdata(dev);
 
     if (!priv) return -ENODEV;
 
-    ssize_t ret = legion_intel_msr_read_pcore_ratio(&priv->intel_msr_private, &ratio);
-    if (ret < 0) return ret;
+    if (sscanf(buf, "%d %d %d %d %d %d %d %d", &r[0], &r[1], &r[2], &r[3], &r[4], &r[5], &r[6], &r[7]) != 8) {
+        dev_err(dev, "Invalid format. Provide 8 numbers for 1C to 8C active limits.\n");
+        return -EINVAL;
+    }
 
-    return sprintf(buf, "%d\n", ratio);
+    for (int i = 0; i < 8; i++) {
+        if ((r[i] < 8 && r[i] != 0) || r[i] > 120) return -EINVAL;
+        msr_val |= ((u64)r[i] << (i * 8));
+    }
+
+    if (legion_intel_msr_apply_pcore_active_ratios(&priv->intel_msr_private, msr_val) < 0) return -EIO;
+    return count;
 }
 
-static ssize_t ecore_all_ratio_show(struct device *dev, struct device_attribute *attr, char *buf)
+/* Per-Core specific ratio targeting */
+static ssize_t core_ratio_limit_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-    int ratio = 0;
+    struct legion_data *priv = dev_get_drvdata(dev);
+    int cpu, ratio, len = 0;
+
+    if (!priv) return -ENODEV;
+
+    // Dumps the current ratio limit for every single online core
+    for_each_online_cpu(cpu) {
+        if (legion_intel_msr_get_per_core_ratio(&priv->intel_msr_private, cpu, &ratio) == 0) {
+            len += sprintf(buf + len, "CPU%d: %d\n", cpu, ratio);
+        }
+    }
+    return len;
+}
+
+static ssize_t core_ratio_limit_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    int target_cpu = 0, ratio = 0;
     struct legion_data *priv = dev_get_drvdata(dev);
 
     if (!priv) return -ENODEV;
 
-    ssize_t ret = legion_intel_msr_read_ecore_ratio(&priv->intel_msr_private, &ratio);
-    if (ret < 0) return ret;
+    // Expects: "<CPU_ID> <RATIO>". If CPU_ID is -1, it applies to ALL cores.
+    if (sscanf(buf, "%d %d", &target_cpu, &ratio) != 2) {
+        dev_err(dev, "Invalid format. Use: '<cpu_id> <ratio>'. Use -1 for all cores.\n");
+        return -EINVAL;
+    }
 
-    return sprintf(buf, "%d\n", ratio);
+    if (target_cpu == -1) {
+        int cpu;
+        for_each_online_cpu(cpu) {
+            legion_intel_msr_set_per_core_ratio(&priv->intel_msr_private, cpu, ratio);
+        }
+    } else {
+        if (!cpu_online(target_cpu)) return -EINVAL;
+        legion_intel_msr_set_per_core_ratio(&priv->intel_msr_private, target_cpu, ratio);
+    }
+    return count;
 }
 
-static ssize_t pcore_all_ratio_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	int ratio = 0;
-	struct legion_data *priv = dev_get_drvdata(dev);
-
-	if (!priv) return -ENODEV;
-	if (kstrtoint(buf, 10, &ratio)) return -EINVAL;
-
-	ssize_t ret = legion_intel_msr_apply_pcore_ratio(&priv->intel_msr_private, ratio);
-	if (ret < 0) return ret;
-
-	return (ssize_t)count;
-}
-
-static ssize_t ecore_all_ratio_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	int ratio = 0;
-	struct legion_data *priv = dev_get_drvdata(dev);
-
-	if (!priv) return -ENODEV;
-	if (kstrtoint(buf, 10, &ratio)) return -EINVAL;
-
-	ssize_t ret = legion_intel_msr_apply_ecore_ratio(&priv->intel_msr_private, ratio);
-	if (ret < 0) return ret;
-
-	return (ssize_t)count;
-}
-
-// Write-only attributes for setting the global ratio
-static DEVICE_ATTR_RW(pcore_all_ratio);
-static DEVICE_ATTR_RW(ecore_all_ratio);
-
+static DEVICE_ATTR_RW(pcore_active_ratios);
+static DEVICE_ATTR_RW(core_ratio_limit);
 // end
 
 static ssize_t cpu_max_undervolt_show(struct device *dev,struct device_attribute *attr, char *buf)
@@ -548,8 +573,8 @@ static struct attribute *legion_intel_msr_sysfs_attributes[]  = {
 	    &dev_attr_uncore_offset.attr,
 	    &dev_attr_analogio_offset.attr,
 		// Added by Slikkelas
-		&dev_attr_pcore_all_ratio.attr,
-		&dev_attr_ecore_all_ratio.attr,
+		&dev_attr_pcore_active_ratios.attr,
+		&dev_attr_core_ratio_limit.attr,
 		// end
 
 	    &dev_attr_cpu_max_undervolt.attr,

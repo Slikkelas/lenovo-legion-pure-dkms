@@ -59,10 +59,10 @@ struct legion_intel_msr_private {
 ssize_t  legion_intel_msr_apply_voltage_offset(struct legion_intel_msr_private *intel_msr_private,int  plane, int offset_uv);
 ssize_t  legion_intel_msr_offset_read_show(struct legion_intel_msr_private *intel_msr_private,int plane,int* offset_uv);
 // Added by Slikkelas
-ssize_t legion_intel_msr_apply_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio);
-ssize_t legion_intel_msr_apply_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio);
-ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio);
-ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio);
+ssize_t legion_intel_msr_apply_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios);
+ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios);
+ssize_t legion_intel_msr_set_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int ratio);
+ssize_t legion_intel_msr_get_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int *ratio);
 // end
 
 int  legion_intel_msr_init(struct legion_intel_msr_private *intel_msr_private);

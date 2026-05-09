@@ -103,147 +103,92 @@ static ssize_t validate_offset(const struct legion_intel_msr_private *intel_msr_
 
 // Added by Slikkelas
 /*
- * Write boost frequency for P- and E-Cores
+ * P-Core Active Core Table Manipulation (MSR 0x1AD)
  */
-static void write_pcore_ratio_on_cpu(void *info)
+static void write_pcore_active_ratios_on_cpu(void *info)
 {
-    const u64 ratio = *(u64 *)info;
-    u64 msr_val = 0;
-
-    // Pack the same ratio into all 8 active-core slots (8 bytes)
-    for (int i = 0; i < 8; i++) {
-        msr_val |= (ratio << (i * 8));
-    }
-
-    wrmsr_safe(MSR_TURBO_RATIO_LIMIT, (u32)msr_val, (u32)(msr_val >> 32));
+    u64 val = *(u64 *)info;
+    wrmsr_safe(MSR_TURBO_RATIO_LIMIT, (u32)val, (u32)(val >> 32));
 }
 
-ssize_t legion_intel_msr_apply_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio)
+static void read_pcore_active_ratios_on_cpu(void *info)
 {
-    u64 data = (u64)ratio;
+    u64 *result = info;
+    u32 low, high;
+    if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
+        *result = ((u64)high << 32) | low;
+    } else {
+        *result = 0;
+    }
+}
 
-    // Sanity check to prevent hard locks (Max ratio usually 85x-120x, keep it safe)
-    if (ratio < 8 || ratio > 120) return -EINVAL;
-
-    guard(mutex)(&intel_msr_private->lock);
-    //** on_each_cpu(write_pcore_ratio_on_cpu, &data, 1); // Backop attempt if smp_call doesn't work
-    smp_call_function_single(0, write_pcore_ratio_on_cpu, &data, 1);
-
+ssize_t legion_intel_msr_apply_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
+{
+    guard(mutex)(&priv->lock);
+    smp_call_function_single(0, write_pcore_active_ratios_on_cpu, &ratios, 1);
     return 0;
 }
 
-
-/*
- * Read boost frequency for P- and E-Cores
- */
-ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
+ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios)
 {
-    u32 low = 0, high = 0;
+    u64 result = 0;
+    guard(mutex)(&priv->lock);
+    smp_call_function_single(0, read_pcore_active_ratios_on_cpu, &result, 1);
     
-    guard(mutex)(&intel_msr_private->lock);
-    
-    // P-Core ratio is package-scoped, reading from CPU 0 is sufficient
-    if (rdmsr_safe_on_cpu(0, MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
-        *ratio = low & 0xFF;
-        return 0;
-    }
-    
-    return -EIO;
+    if (result == 0) return -EIO;
+    *ratios = result;
+    return 0;
 }
 
-static void read_ecore_ratio_on_cpu(void *info)
+/*
+ * Per-Core Boost Ratio Manipulation via HWP (MSR 0x774)
+ */
+struct hwp_ratio_data {
+    int ratio;
+};
+
+static void write_per_core_ratio_on_cpu(void *info)
+{
+    struct hwp_ratio_data *data = info;
+    u32 req_low, req_high;
+    
+    if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
+        req_low &= ~(0xFF << 8); // Clear bits 15:8 (Maximum Performance)
+        req_low |= ((data->ratio & 0xFF) << 8); // Set new target max limit
+        wrmsr_safe(MSR_HWP_REQUEST, req_low, req_high);
+    }
+}
+
+static void read_per_core_ratio_on_cpu(void *info)
 {
     u32 *result = info;
-    unsigned int eax, ebx, ecx, edx;
-    u32 cap_low, cap_high, req_low, req_high, ratio_low, ratio_high;
-
-    // Execute CPUID Leaf 0x1A (Core Type). 0x20 = Atom (E-Core), 0x40 = Core (P-Core)
-    cpuid(0x1A, &eax, &ebx, &ecx, &edx);
-    if (((eax >> 24) & 0xFF) == 0x20) {
-        
-        // 1. Read Physical Fused Silicon Limit (e.g., 47) from MSR_ATOM_CORE_RATIOS
-        if (rdmsr_safe(MSR_ATOM_CORE_RATIOS, &ratio_low, &ratio_high) == 0) {
-            u32 factory_ratio = (ratio_low >> 16) & 0xFF; // Bits 23:16 is Max Turbo Ratio
-            
-            // 2. Read Abstract HWP Capability (e.g., 65)
-            if (rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0) {
-                u32 hwp_max = cap_low & 0xFF;
-                
-                // 3. Read Active HWP Request
-                if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
-                    u32 active_hwp = (req_low >> 8) & 0xFF;
-                    
-                    // Scale the abstract HWP unit mathematically back to the physical multiplier
-                    if (hwp_max > 0) {
-                        *result = (active_hwp * factory_ratio) / hwp_max;
-                    }
-                }
-            }
-        }
+    u32 req_low, req_high;
+    
+    if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
+        *result = (req_low >> 8) & 0xFF; 
+    } else {
+        *result = 0;
     }
 }
 
-ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
+ssize_t legion_intel_msr_set_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int ratio)
+{
+    struct hwp_ratio_data data = { .ratio = ratio };
+    if (ratio < 8 || ratio > 120) return -EINVAL;
+    
+    guard(mutex)(&priv->lock);
+    smp_call_function_single(cpu, write_per_core_ratio_on_cpu, &data, 1);
+    return 0;
+}
+
+ssize_t legion_intel_msr_get_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int *ratio)
 {
     u32 result = 0;
-    int cpu;
+    guard(mutex)(&priv->lock);
+    smp_call_function_single(cpu, read_per_core_ratio_on_cpu, &result, 1);
     
-    guard(mutex)(&intel_msr_private->lock);
-    
-    for_each_online_cpu(cpu) {
-        smp_call_function_single(cpu, read_ecore_ratio_on_cpu, &result, 1);
-        if (result != 0) {
-            *ratio = (int)result;
-            return 0;
-        }
-    }
-    
-    return -EIO;
-}
-
-/*
- * Write boost frequency for E-Cores via scaled HWP Request
- */
-static void write_ecore_ratio_on_cpu(void *info)
-{
-    const u32 target_ratio = *(u32 *)info;
-    unsigned int eax, ebx, ecx, edx;
-    u32 cap_low, cap_high, req_low, req_high, ratio_low, ratio_high;
-    
-    cpuid(0x1A, &eax, &ebx, &ecx, &edx);
-    if (((eax >> 24) & 0xFF) == 0x20) {
-        if (rdmsr_safe(MSR_ATOM_CORE_RATIOS, &ratio_low, &ratio_high) == 0 &&
-            rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0 &&
-            rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
-            
-            u32 factory_ratio = (ratio_low >> 16) & 0xFF;
-            u32 hwp_max = cap_low & 0xFF;
-            
-            if (factory_ratio > 0) {
-                // Scale the user's multiplier (e.g., 40) into the abstract HWP unit (e.g., 55)
-                u32 scaled_hwp = (target_ratio * hwp_max) / factory_ratio;
-                
-                if (scaled_hwp > hwp_max) scaled_hwp = hwp_max;
-                
-                // Clear bits 15:8 (Maximum Performance) and inject scaled limit
-                req_low &= ~(0xFF << 8);
-                req_low |= (scaled_hwp << 8);
-                
-                wrmsr_safe(MSR_HWP_REQUEST, req_low, req_high);
-            }
-        }
-    }
-}
-
-ssize_t legion_intel_msr_apply_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio)
-{
-    u32 data = (u32)ratio;
-
-    if (ratio < 8 || ratio > 120) return -EINVAL;
-
-    guard(mutex)(&intel_msr_private->lock);
-    on_each_cpu(write_ecore_ratio_on_cpu, &data, 1);
-
+    if (result == 0) return -EIO;
+    *ratio = (int)result;
     return 0;
 }
 // end
