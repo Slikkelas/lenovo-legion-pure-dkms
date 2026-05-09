@@ -214,6 +214,9 @@ ssize_t legion_intel_msr_apply_ecore_ratio(struct legion_intel_msr_private *inte
     return 0;
 }
 
+/*
+ * Read boost frequency for E-Cores via HWP Request MSR
+ */
 ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
 {
     u32 low = 0, high = 0;
@@ -223,23 +226,29 @@ ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel
     
     guard(mutex)(&intel_msr_private->lock);
     
-    // Read P-Core max ratio from CPU 0
+    // Read P-Core max ratio from CPU 0 to use as our baseline
     if (rdmsr_safe_on_cpu(0, MSR_HWP_CAPABILITIES, &low, &high) == 0) {
         pcore_max = low & 0xFF;
     } else {
         return -EIO;
     }
     
-    // Find the first E-Core and read its active HWP limit
+    // Find the first E-Core
     for_each_online_cpu(cpu) {
         if (rdmsr_safe_on_cpu(cpu, MSR_HWP_CAPABILITIES, &low, &high) == 0) {
-            u32 core_max = low & 0xFF;
+            u32 core_max = low & 0xFF; // Physical factory limit (e.g., 47)
             
-            // Is it an E-Core?
+            // Defining if it's an E-Core
             if (core_max < pcore_max) {
-                // Read its CURRENT active limit from the HWP Request register
+                // Read its current active limit from the HWP Request register
                 if (rdmsr_safe_on_cpu(cpu, MSR_HWP_REQUEST, &low, &high) == 0) {
-                    *ratio = (low >> 8) & 0xFF; // Bits 15:8 are Maximum Performance
+                    u32 active_limit = (low >> 8) & 0xFF; // Bits 15:8 are Maximum Performance
+                    
+                    // If the OS is requesting a limit higher than the physical max (e.g., 65),
+                    // Then clamp the reported value down to the physical silicon limit (47).
+                    // If you manually set it lower (e.g., 40), it will accurately report 40.
+                    *ratio = (active_limit > core_max) ? core_max : active_limit;
+                    
                     success = true;
                     break;
                 }
