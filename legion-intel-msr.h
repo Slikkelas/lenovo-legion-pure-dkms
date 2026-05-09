@@ -23,13 +23,15 @@
 #ifndef MSR_TURBO_RATIO_LIMIT
 #define MSR_TURBO_RATIO_LIMIT 0x1AD
 #endif
+#ifndef MSR_ATOM_CORE_RATIOS
+#define MSR_ATOM_CORE_RATIOS 0x66A
+#endif
 #ifndef MSR_HWP_CAPABILITIES
 #define MSR_HWP_CAPABILITIES 0x771
 #endif
 #ifndef MSR_HWP_REQUEST
 #define MSR_HWP_REQUEST 0x774
 #endif
-//** #define MSR_ATOM_CORE_TURBO_RATIOS 0x66C
 // end
 
 // Modified by Slikkelas

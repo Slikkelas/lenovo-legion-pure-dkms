@@ -151,39 +151,84 @@ ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel
     return -EIO;
 }
 
-/*
- * Structure for dynamic E-core detection and HWP ratio writing
- */
-struct ecore_ratio_data {
-    u32 pcore_factory_max;
-    u32 target_ratio;
-};
+static void read_ecore_ratio_on_cpu(void *info)
+{
+    u32 *result = info;
+    unsigned int eax, ebx, ecx, edx;
+    u32 cap_low, cap_high, req_low, req_high, ratio_low, ratio_high;
+
+    // Execute CPUID Leaf 0x1A (Core Type). 0x20 = Atom (E-Core), 0x40 = Core (P-Core)
+    cpuid(0x1A, &eax, &ebx, &ecx, &edx);
+    if (((eax >> 24) & 0xFF) == 0x20) {
+        
+        // 1. Read Physical Fused Silicon Limit (e.g., 47) from MSR_ATOM_CORE_RATIOS
+        if (rdmsr_safe(MSR_ATOM_CORE_RATIOS, &ratio_low, &ratio_high) == 0) {
+            u32 factory_ratio = (ratio_low >> 16) & 0xFF; // Bits 23:16 is Max Turbo Ratio
+            
+            // 2. Read Abstract HWP Capability (e.g., 65)
+            if (rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0) {
+                u32 hwp_max = cap_low & 0xFF;
+                
+                // 3. Read Active HWP Request
+                if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
+                    u32 active_hwp = (req_low >> 8) & 0xFF;
+                    
+                    // Scale the abstract HWP unit mathematically back to the physical multiplier
+                    if (hwp_max > 0) {
+                        *result = (active_hwp * factory_ratio) / hwp_max;
+                    }
+                }
+            }
+        }
+    }
+}
+
+ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
+{
+    u32 result = 0;
+    int cpu;
+    
+    guard(mutex)(&intel_msr_private->lock);
+    
+    for_each_online_cpu(cpu) {
+        smp_call_function_single(cpu, read_ecore_ratio_on_cpu, &result, 1);
+        if (result != 0) {
+            *ratio = (int)result;
+            return 0;
+        }
+    }
+    
+    return -EIO;
+}
 
 /*
- * Write boost frequency for E-Cores via HWP Request MSR
+ * Write boost frequency for E-Cores via scaled HWP Request
  */
 static void write_ecore_ratio_on_cpu(void *info)
 {
-    struct ecore_ratio_data *data = info;
-    u32 cap_low, cap_high;
-    u32 req_low, req_high;
-
-    // 1. Read HWP Capabilities to identify if this specific core is an E-core
-    if (rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0) {
-        u32 core_max = cap_low & 0xFF;
-        
-        // If this core's factory max ratio is strictly lower than the P-Core factory max, it is an E-Core
-        if (core_max < data->pcore_factory_max) {
+    const u32 target_ratio = *(u32 *)info;
+    unsigned int eax, ebx, ecx, edx;
+    u32 cap_low, cap_high, req_low, req_high, ratio_low, ratio_high;
+    
+    cpuid(0x1A, &eax, &ebx, &ecx, &edx);
+    if (((eax >> 24) & 0xFF) == 0x20) {
+        if (rdmsr_safe(MSR_ATOM_CORE_RATIOS, &ratio_low, &ratio_high) == 0 &&
+            rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0 &&
+            rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
             
-            // 2. Read the current HWP Request state
-            if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
-                // Bits 15:8 control Maximum Performance. Clear them.
-                req_low &= ~(0xFF << 8); 
+            u32 factory_ratio = (ratio_low >> 16) & 0xFF;
+            u32 hwp_max = cap_low & 0xFF;
+            
+            if (factory_ratio > 0) {
+                // Scale the user's multiplier (e.g., 40) into the abstract HWP unit (e.g., 55)
+                u32 scaled_hwp = (target_ratio * hwp_max) / factory_ratio;
                 
-                // Insert our new ratio limit
-                req_low |= ((data->target_ratio & 0xFF) << 8); 
+                if (scaled_hwp > hwp_max) scaled_hwp = hwp_max;
                 
-                // Commit to hardware
+                // Clear bits 15:8 (Maximum Performance) and inject scaled limit
+                req_low &= ~(0xFF << 8);
+                req_low |= (scaled_hwp << 8);
+                
                 wrmsr_safe(MSR_HWP_REQUEST, req_low, req_high);
             }
         }
@@ -192,72 +237,13 @@ static void write_ecore_ratio_on_cpu(void *info)
 
 ssize_t legion_intel_msr_apply_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio)
 {
-    struct ecore_ratio_data data;
-    u32 low, high;
+    u32 data = (u32)ratio;
 
     if (ratio < 8 || ratio > 120) return -EINVAL;
 
     guard(mutex)(&intel_msr_private->lock);
-
-    // Read CPU 0 (Guaranteed P-Core) factory max ratio to use as our dynamic baseline
-    if (rdmsr_safe_on_cpu(0, MSR_HWP_CAPABILITIES, &low, &high) == 0) {
-        data.pcore_factory_max = low & 0xFF;
-    } else {
-        return -EIO;
-    }
-
-    data.target_ratio = ratio;
-
-    // Broadcast to all CPUs; the function safely filters out the P-cores internally
     on_each_cpu(write_ecore_ratio_on_cpu, &data, 1);
 
-    return 0;
-}
-
-/*
- * Read boost frequency for E-Cores via HWP Request MSR
- */
-ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
-{
-    u32 low = 0, high = 0;
-    u32 pcore_max = 0;
-    int cpu;
-    bool success = false;
-    
-    guard(mutex)(&intel_msr_private->lock);
-    
-    // Read P-Core max ratio from CPU 0 to use as our baseline
-    if (rdmsr_safe_on_cpu(0, MSR_HWP_CAPABILITIES, &low, &high) == 0) {
-        pcore_max = low & 0xFF;
-    } else {
-        return -EIO;
-    }
-    
-    // Find the first E-Core
-    for_each_online_cpu(cpu) {
-        if (rdmsr_safe_on_cpu(cpu, MSR_HWP_CAPABILITIES, &low, &high) == 0) {
-            u32 core_max = low & 0xFF; // Physical factory limit (e.g., 47)
-            
-            // Defining if it's an E-Core
-            if (core_max < pcore_max) {
-                // Read its current active limit from the HWP Request register
-                if (rdmsr_safe_on_cpu(cpu, MSR_HWP_REQUEST, &low, &high) == 0) {
-                    u32 active_limit = (low >> 8) & 0xFF; // Bits 15:8 are Maximum Performance
-                    
-                    // If the OS is requesting a limit higher than the physical max (e.g., 65),
-                    // Then clamp the reported value down to the physical silicon limit (47).
-                    // If you manually set it lower (e.g., 40), it will accurately report 40.
-                    *ratio = (active_limit > core_max) ? core_max : active_limit;
-                    
-                    success = true;
-                    break;
-                }
-            }
-        }
-    }
-    
-    if (!success) return -EIO;
-    
     return 0;
 }
 // end
