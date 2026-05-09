@@ -162,69 +162,112 @@ ssize_t legion_intel_msr_apply_ecore_ratio(struct legion_intel_msr_private *inte
 /*
  * Read boost frequency for P- and E-Cores
  */
-static void read_pcore_ratio_on_cpu(void *info)
-{
-    u64 *result = info;
-    u32 low = 0, high = 0;
-
-    if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) 
-    {
-        // Read the lowest 8 bits (1-core active limit)
-        *result = low & 0xFF; 
-    } 
-    else 
-    {
-        *result = 0;
-    }
-}
-
-static void read_ecore_ratio_on_cpu(void *info)
-{
-    u64 *result = info;
-    u32 low = 0, high = 0;
-
-    if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) 
-    {
-        // Read the lowest 8 bits (Group 0 limit)
-        *result = low & 0xFF; 
-    } 
-    //** else 
-    //** {
-    //**    *result = 0;
-    //** }
-}
-
+// Abandon reading directly from cpu and using rdmsr_safe_on_cpu() instead.
+//**	static void read_pcore_ratio_on_cpu(void *info)
+//**	{
+//**	    u64 *result = info;
+//**	    u32 low = 0, high = 0;
+//**
+//**	    if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) 
+//**	    {
+//**	        // Read the lowest 8 bits (1-core active limit)
+//**	        *result = low & 0xFF; 
+//**	    } 
+//**	    else 
+//**	    {
+//**	        *result = 0;
+//**	    }
+//**	}
+//**
+//**	static void read_ecore_ratio_on_cpu(void *info)
+//**	{
+//**	    u64 *result = info;
+//**	    u32 low = 0, high = 0;
+//**
+//**	    if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) 
+//**	    {
+//**        // Read the lowest 8 bits (Group 0 limit)
+//**	        *result = low & 0xFF; 
+//**	    } 
+//**	    //** else 
+//**	    //** {
+//**	    //**    *result = 0;
+//**	    //** }
+//**	}
+//**
+//**	ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
+//**	{
+//**	    u64 result = 0;
+//**    
+//**	    guard(mutex)(&intel_msr_private->lock);
+//**	    smp_call_function_single(0, read_pcore_ratio_on_cpu, &result, 1);
+//**    
+//**	    if (result == 0) return -EIO;
+//**    
+//**	    *ratio = (int)result;
+//**	    return 0;
+//**	}
+//**
+//**	ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
+//**	{
+//**	    u64 result = 0;
+//**	    int cpu;
+//**    
+//**	    guard(mutex)(&intel_msr_private->lock);
+//**    
+//**	    //** smp_call_function_single(0, read_ecore_ratio_on_cpu, &result, 1);
+//**	    // Loop through online CPUs until it finds an E-Core that answers
+//**	        for_each_online_cpu(cpu) {
+//**	            smp_call_function_single(cpu, read_ecore_ratio_on_cpu, &result, 1);
+//**	            if (result != 0) {
+//**	                break;
+//**	            }
+//**	        }
+//**	    if (result == 0) return -EIO;
+//**    
+//**	    *ratio = (int)result;
+//**	    return 0;
+//**	}
 ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
 {
-    u64 result = 0;
+    u32 low = 0, high = 0;
     
     guard(mutex)(&intel_msr_private->lock);
-    smp_call_function_single(0, read_pcore_ratio_on_cpu, &result, 1);
     
-    if (result == 0) return -EIO;
+    // P-Core ratio is package-scoped, reading from CPU 0 is sufficient
+    if (rdmsr_safe_on_cpu(0, MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
+        *ratio = low & 0xFF;
+        return 0;
+    }
     
-    *ratio = (int)result;
-    return 0;
+    return -EIO;
 }
 
 ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
 {
-    u64 result = 0;
+    u32 low = 0, high = 0;
     int cpu;
+    bool success = false;
     
     guard(mutex)(&intel_msr_private->lock);
     
-    //** smp_call_function_single(0, read_ecore_ratio_on_cpu, &result, 1);
-    // Loop through online CPUs until it finds an E-Core that answers
-        for_each_online_cpu(cpu) {
-            smp_call_function_single(cpu, read_ecore_ratio_on_cpu, &result, 1);
-            if (result != 0) {
+    // Loop through online CPUs to find the E-Core limits
+    for_each_online_cpu(cpu) {
+        if (rdmsr_safe_on_cpu(cpu, MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
+            *ratio = low & 0xFF;
+            success = true;
+            
+            // If we find a core that actually has a limit configured (> 0), we can stop looking.
+            // If it returns 0, we keep checking other cores just in case it was a P-core returning dummy zeroes.
+            if (*ratio != 0) {
                 break;
             }
         }
-    if (result == 0) return -EIO;
+    }
     
-    *ratio = (int)result;
+    // If no core allowed us to read the MSR, then throw the IO error
+    if (!success) return -EIO;
+    
     return 0;
 }
 // end
