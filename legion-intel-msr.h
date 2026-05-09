@@ -20,7 +20,15 @@
 #define PLANE_ANALOGIO  4
 #define NUM_VOLTAGE_PLANES 5
 // Added by Slikkelas (Only if needed, but most kernels do have this registers already included)
-//** #define MSR_TURBO_RATIO_LIMIT 0x1AD
+#ifndef MSR_TURBO_RATIO_LIMIT
+#define MSR_TURBO_RATIO_LIMIT 0x1AD
+#endif
+#ifndef MSR_HWP_CAPABILITIES
+#define MSR_HWP_CAPABILITIES 0x771
+#endif
+#ifndef MSR_HWP_REQUEST
+#define MSR_HWP_REQUEST 0x774
+#endif
 //** #define MSR_ATOM_CORE_TURBO_RATIOS 0x66C
 // end
 

@@ -118,19 +118,6 @@ static void write_pcore_ratio_on_cpu(void *info)
     wrmsr_safe(MSR_TURBO_RATIO_LIMIT, (u32)msr_val, (u32)(msr_val >> 32));
 }
 
-static void write_ecore_ratio_on_cpu(void *info)
-{
-    const u64 ratio = *(u64 *)info;
-    u64 msr_val = 0;
-
-    // Pack the same ratio into all 8 active-core slots (8 bytes)
-    for (int i = 0; i < 8; i++) {
-        msr_val |= (ratio << (i * 8));
-    }
-
-    wrmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, (u32)msr_val, (u32)(msr_val >> 32));
-}
-
 ssize_t legion_intel_msr_apply_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio)
 {
     u64 data = (u64)ratio;
@@ -145,89 +132,10 @@ ssize_t legion_intel_msr_apply_pcore_ratio(struct legion_intel_msr_private *inte
     return 0;
 }
 
-ssize_t legion_intel_msr_apply_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio)
-{
-    u64 data = (u64)ratio;
-
-    // Sanity check to prevent hard locks
-    if (ratio < 8 || ratio > 120) return -EINVAL;
-
-    guard(mutex)(&intel_msr_private->lock);
-    on_each_cpu(write_ecore_ratio_on_cpu, &data, 1); // Backop attempt if smp_call doesn't work
-    //** smp_call_function_single(0, write_ecore_ratio_on_cpu, &data, 1);
-
-    return 0;
-}
 
 /*
  * Read boost frequency for P- and E-Cores
  */
-// Abandon reading directly from cpu and using rdmsr_safe_on_cpu() instead.
-//**	static void read_pcore_ratio_on_cpu(void *info)
-//**	{
-//**	    u64 *result = info;
-//**	    u32 low = 0, high = 0;
-//**
-//**	    if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) 
-//**	    {
-//**	        // Read the lowest 8 bits (1-core active limit)
-//**	        *result = low & 0xFF; 
-//**	    } 
-//**	    else 
-//**	    {
-//**	        *result = 0;
-//**	    }
-//**	}
-//**
-//**	static void read_ecore_ratio_on_cpu(void *info)
-//**	{
-//**	    u64 *result = info;
-//**	    u32 low = 0, high = 0;
-//**
-//**	    if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) 
-//**	    {
-//**        // Read the lowest 8 bits (Group 0 limit)
-//**	        *result = low & 0xFF; 
-//**	    } 
-//**	    //** else 
-//**	    //** {
-//**	    //**    *result = 0;
-//**	    //** }
-//**	}
-//**
-//**	ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
-//**	{
-//**	    u64 result = 0;
-//**    
-//**	    guard(mutex)(&intel_msr_private->lock);
-//**	    smp_call_function_single(0, read_pcore_ratio_on_cpu, &result, 1);
-//**    
-//**	    if (result == 0) return -EIO;
-//**    
-//**	    *ratio = (int)result;
-//**	    return 0;
-//**	}
-//**
-//**	ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
-//**	{
-//**	    u64 result = 0;
-//**	    int cpu;
-//**    
-//**	    guard(mutex)(&intel_msr_private->lock);
-//**    
-//**	    //** smp_call_function_single(0, read_ecore_ratio_on_cpu, &result, 1);
-//**	    // Loop through online CPUs until it finds an E-Core that answers
-//**	        for_each_online_cpu(cpu) {
-//**	            smp_call_function_single(cpu, read_ecore_ratio_on_cpu, &result, 1);
-//**	            if (result != 0) {
-//**	                break;
-//**	            }
-//**	        }
-//**	    if (result == 0) return -EIO;
-//**    
-//**	    *ratio = (int)result;
-//**	    return 0;
-//**	}
 ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
 {
     u32 low = 0, high = 0;
@@ -243,29 +151,102 @@ ssize_t legion_intel_msr_read_pcore_ratio(struct legion_intel_msr_private *intel
     return -EIO;
 }
 
+/*
+ * Structure for dynamic E-core detection and HWP ratio writing
+ */
+struct ecore_ratio_data {
+    u32 pcore_factory_max;
+    u32 target_ratio;
+};
+
+/*
+ * Write boost frequency for E-Cores via HWP Request MSR
+ */
+static void write_ecore_ratio_on_cpu(void *info)
+{
+    struct ecore_ratio_data *data = info;
+    u32 cap_low, cap_high;
+    u32 req_low, req_high;
+
+    // 1. Read HWP Capabilities to identify if this specific core is an E-core
+    if (rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0) {
+        u32 core_max = cap_low & 0xFF;
+        
+        // If this core's factory max ratio is strictly lower than the P-Core factory max, it is an E-Core
+        if (core_max < data->pcore_factory_max) {
+            
+            // 2. Read the current HWP Request state
+            if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
+                // Bits 15:8 control Maximum Performance. Clear them.
+                req_low &= ~(0xFF << 8); 
+                
+                // Insert our new ratio limit
+                req_low |= ((data->target_ratio & 0xFF) << 8); 
+                
+                // Commit to hardware
+                wrmsr_safe(MSR_HWP_REQUEST, req_low, req_high);
+            }
+        }
+    }
+}
+
+ssize_t legion_intel_msr_apply_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int ratio)
+{
+    struct ecore_ratio_data data;
+    u32 low, high;
+
+    if (ratio < 8 || ratio > 120) return -EINVAL;
+
+    guard(mutex)(&intel_msr_private->lock);
+
+    // Read CPU 0 (Guaranteed P-Core) factory max ratio to use as our dynamic baseline
+    if (rdmsr_safe_on_cpu(0, MSR_HWP_CAPABILITIES, &low, &high) == 0) {
+        data.pcore_factory_max = low & 0xFF;
+    } else {
+        return -EIO;
+    }
+
+    data.target_ratio = ratio;
+
+    // Broadcast to all CPUs; the function safely filters out the P-cores internally
+    on_each_cpu(write_ecore_ratio_on_cpu, &data, 1);
+
+    return 0;
+}
+
 ssize_t legion_intel_msr_read_ecore_ratio(struct legion_intel_msr_private *intel_msr_private, int *ratio)
 {
     u32 low = 0, high = 0;
+    u32 pcore_max = 0;
     int cpu;
     bool success = false;
     
     guard(mutex)(&intel_msr_private->lock);
     
-    // Loop through online CPUs to find the E-Core limits
+    // Read P-Core max ratio from CPU 0
+    if (rdmsr_safe_on_cpu(0, MSR_HWP_CAPABILITIES, &low, &high) == 0) {
+        pcore_max = low & 0xFF;
+    } else {
+        return -EIO;
+    }
+    
+    // Find the first E-Core and read its active HWP limit
     for_each_online_cpu(cpu) {
-        if (rdmsr_safe_on_cpu(cpu, MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
-            *ratio = low & 0xFF;
-            success = true;
+        if (rdmsr_safe_on_cpu(cpu, MSR_HWP_CAPABILITIES, &low, &high) == 0) {
+            u32 core_max = low & 0xFF;
             
-            // If we find a core that actually has a limit configured (> 0), we can stop looking.
-            // If it returns 0, we keep checking other cores just in case it was a P-core returning dummy zeroes.
-            if (*ratio != 0) {
-                break;
+            // Is it an E-Core?
+            if (core_max < pcore_max) {
+                // Read its CURRENT active limit from the HWP Request register
+                if (rdmsr_safe_on_cpu(cpu, MSR_HWP_REQUEST, &low, &high) == 0) {
+                    *ratio = (low >> 8) & 0xFF; // Bits 15:8 are Maximum Performance
+                    success = true;
+                    break;
+                }
             }
         }
     }
     
-    // If no core allowed us to read the MSR, then throw the IO error
     if (!success) return -EIO;
     
     return 0;
