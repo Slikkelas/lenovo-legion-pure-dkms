@@ -139,6 +139,59 @@ ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_privat
     return 0;
 }
 
+/*
+ * E-Core Active Core Table Manipulation (MSR 0x66C)
+ */
+static void write_ecore_active_ratios_on_cpu(void *info)
+{
+    u64 val = *(u64 *)info;
+    wrmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, (u32)val, (u32)(val >> 32));
+}
+
+// Struct to prevent the "zero-value" bug
+struct ecore_read_res {
+    u64 val;
+    bool success;
+};
+
+static void read_ecore_active_ratios_on_cpu(void *info)
+{
+    struct ecore_read_res *res = info;
+    u32 low, high;
+    
+    // If the hardware answers, mark success (even if the value is 0)
+    if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
+        res->val = ((u64)high << 32) | low;
+        res->success = true;
+    }
+}
+
+ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
+{
+    guard(mutex)(&priv->lock);
+    // E-core registers are module-scoped, broadcast to hit all clusters
+    on_each_cpu(write_ecore_active_ratios_on_cpu, &ratios, 1);
+    return 0;
+}
+
+ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios)
+{
+    struct ecore_read_res res = { .val = 0, .success = false };
+    int cpu;
+    
+    guard(mutex)(&priv->lock);
+    
+    for_each_online_cpu(cpu) {
+        smp_call_function_single(cpu, read_ecore_active_ratios_on_cpu, &res, 1);
+        if (res.success) {
+            *ratios = res.val;
+            return 0;
+        }
+    }
+    
+    return -EIO;
+}
+
 /* Per-Core Boost Ratio Manipulation via raw HWP (MSR 0x774) */
 struct hwp_ratio_data {
     int ratio;

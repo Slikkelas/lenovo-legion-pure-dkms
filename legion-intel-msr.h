@@ -23,6 +23,9 @@
 #ifndef MSR_TURBO_RATIO_LIMIT
 #define MSR_TURBO_RATIO_LIMIT 0x1AD
 #endif
+#ifndef MSR_ATOM_CORE_TURBO_RATIOS
+#define MSR_ATOM_CORE_TURBO_RATIOS 0x66C
+#endif
 #ifndef MSR_ATOM_CORE_RATIOS
 #define MSR_ATOM_CORE_RATIOS 0x66A
 #endif
@@ -61,6 +64,8 @@ ssize_t  legion_intel_msr_offset_read_show(struct legion_intel_msr_private *inte
 // Added by Slikkelas
 ssize_t legion_intel_msr_apply_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios);
 ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios);
+ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios);
+ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios);
 ssize_t legion_intel_msr_set_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int ratio);
 ssize_t legion_intel_msr_get_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int *ratio);
 // end
