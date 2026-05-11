@@ -134,15 +134,12 @@ ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_privat
     u64 result = 0;
     guard(mutex)(&priv->lock);
     smp_call_function_single(0, read_pcore_active_ratios_on_cpu, &result, 1);
-    
     if (result == 0) return -EIO;
     *ratios = result;
     return 0;
 }
 
-/*
- * Per-Core Boost Ratio Manipulation via HWP (MSR 0x774)
- */
+/* Per-Core Boost Ratio Manipulation via raw HWP (MSR 0x774) */
 struct hwp_ratio_data {
     int ratio;
 };
@@ -150,85 +147,31 @@ struct hwp_ratio_data {
 static void write_per_core_ratio_on_cpu(void *info)
 {
     struct hwp_ratio_data *data = info;
-    unsigned int eax, ebx, ecx, edx;
-    u32 cap_low, cap_high, req_low, req_high, ratio_low, ratio_high;
-    u32 factory_ratio = 0;
-    u32 core_type;
-
-    // CPUID Leaf 0x1A (Core Type Enumeration)
-    cpuid(0x1A, &eax, &ebx, &ecx, &edx);
-    core_type = (eax >> 24) & 0xFF;
-
-    // Fetching the physical 1-core max ratio based on silicon type
-    if (core_type == 0x40) { // P-Core
-        if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &ratio_low, &ratio_high) == 0) {
-            factory_ratio = ratio_low & 0xFF;
-        }
-    } else if (core_type == 0x20) { // E-Core
-        if (rdmsr_safe(MSR_ATOM_CORE_RATIOS, &ratio_low, &ratio_high) == 0) {
-            factory_ratio = (ratio_low >> 16) & 0xFF; // Bits 23:16 hold E-core max
-        }
-    }
-
-    if (factory_ratio > 0 && rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0) {
-        u32 hwp_max = cap_low & 0xFF; // The abstract max (e.g., 85 or 65)
-
-        if (hwp_max > 0 && rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
-            // Scale the user's physical ratio into the abstract HWP unit
-            u32 scaled_hwp = DIV_ROUND_CLOSEST(data->ratio * hwp_max, factory_ratio);
-            
-            // Safety cap at 8-bit max
-            if (scaled_hwp > 0xFF) scaled_hwp = 0xFF;
-
-            // Clear Bits 15:8 (Maximum Performance) and inject scaled limit
-            req_low &= ~(0xFF << 8); 
-            req_low |= (scaled_hwp << 8); 
-
-            wrmsr_safe(MSR_HWP_REQUEST, req_low, req_high);
-        }
+    u32 req_low, req_high;
+    
+    if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
+        req_low &= ~(0xFF << 8); // Clear bits 15:8 (Maximum Performance)
+        req_low |= ((data->ratio & 0xFF) << 8); // Inject raw hardware limit
+        wrmsr_safe(MSR_HWP_REQUEST, req_low, req_high);
     }
 }
 
 static void read_per_core_ratio_on_cpu(void *info)
 {
     u32 *result = info;
-    unsigned int eax, ebx, ecx, edx;
-    u32 cap_low, cap_high, req_low, req_high, ratio_low, ratio_high;
-    u32 factory_ratio = 0;
-    u32 core_type;
-
-    *result = 0; // Default fallback
-
-    // CPUID Leaf 0x1A (Core Type Enumeration)
-    cpuid(0x1A, &eax, &ebx, &ecx, &edx);
-    core_type = (eax >> 24) & 0xFF;
-
-    if (core_type == 0x40) { // P-Core
-        if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &ratio_low, &ratio_high) == 0) {
-            factory_ratio = ratio_low & 0xFF;
-        }
-    } else if (core_type == 0x20) { // E-Core
-        if (rdmsr_safe(MSR_ATOM_CORE_RATIOS, &ratio_low, &ratio_high) == 0) {
-            factory_ratio = (ratio_low >> 16) & 0xFF;
-        }
-    }
-
-    if (factory_ratio > 0 && rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0) {
-        u32 hwp_max = cap_low & 0xFF;
-
-        if (hwp_max > 0 && rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
-            u32 active_hwp = (req_low >> 8) & 0xFF;
-            
-            // Scale abstract HWP unit back into real physical ratio (e.g., 54 or 47)
-            *result = DIV_ROUND_CLOSEST(active_hwp * factory_ratio, hwp_max);
-        }
+    u32 req_low, req_high;
+    
+    if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
+        *result = (req_low >> 8) & 0xFF; // Fetch raw hardware limit
+    } else {
+        *result = 0;
     }
 }
 
 ssize_t legion_intel_msr_set_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int ratio)
 {
     struct hwp_ratio_data data = { .ratio = ratio };
-    if (ratio < 8 || ratio > 120) return -EINVAL;
+    if (ratio < 8 || ratio > 255) return -EINVAL; // Allow raw limits up to 0xFF
     
     guard(mutex)(&priv->lock);
     smp_call_function_single(cpu, write_per_core_ratio_on_cpu, &data, 1);

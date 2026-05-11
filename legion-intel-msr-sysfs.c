@@ -278,7 +278,7 @@ static ssize_t pcore_active_ratios_store(struct device *dev, struct device_attri
     }
 
     for (int i = 0; i < 8; i++) {
-        if ((r[i] < 8 && r[i] != 0) || r[i] > 120) return -EINVAL;
+        if ((r[i] < 8 && r[i] != 0) || r[i] > 255) return -EINVAL;
         msr_val |= ((u64)r[i] << (i * 8));
     }
 
@@ -294,7 +294,6 @@ static ssize_t core_ratio_limit_show(struct device *dev, struct device_attribute
 
     if (!priv) return -ENODEV;
 
-    // Dumps the current ratio limit for every single online core
     for_each_online_cpu(cpu) {
         if (legion_intel_msr_get_per_core_ratio(&priv->intel_msr_private, cpu, &ratio) == 0) {
             len += sprintf(buf + len, "CPU%d: %d\n", cpu, ratio);
@@ -310,7 +309,6 @@ static ssize_t core_ratio_limit_store(struct device *dev, struct device_attribut
 
     if (!priv) return -ENODEV;
 
-    // Expects: "<CPU_ID> <RATIO>". If CPU_ID is -1, it applies to ALL cores.
     if (sscanf(buf, "%d %d", &target_cpu, &ratio) != 2) {
         dev_err(dev, "Invalid format. Use: '<cpu_id> <ratio>'. Use -1 for all cores.\n");
         return -EINVAL;
