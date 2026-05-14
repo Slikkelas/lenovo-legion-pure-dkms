@@ -137,36 +137,9 @@ static int get_intel_core_type_on_cpu(int cpu)
     return INTEL_HYBRID_CORE_TYPE_PCORE;
 }
 
-// Unified struct for ratio reads
-struct core_ratio_res {
-    u64 val;
-    bool success;
-};
-
 /*
  * P-Core Active Core Table Manipulation (MSR 0x1AD)
  */
-static void write_pcore_active_ratios_on_cpu(void *info)
-{
-    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_PCORE) {
-        u64 val = *(u64 *)info;
-        wrmsr_safe(MSR_TURBO_RATIO_LIMIT, (u32)val, (u32)(val >> 32));
-    }
-}
-
-static void read_pcore_active_ratios_on_cpu(void *info)
-{
-    struct core_ratio_res *res = info;
-    u32 low, high;
-
-    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_PCORE) {
-        if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
-            res->val = ((u64)high << 32) | low;
-            res->success = true;
-        }
-    }
-}
-
 ssize_t legion_intel_msr_apply_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
 {
     int cpu;
@@ -177,8 +150,10 @@ ssize_t legion_intel_msr_apply_pcore_active_ratios(struct legion_intel_msr_priva
     guard(mutex)(&priv->lock);
 
     for_each_online_cpu(cpu) {
-        if (wrmsr_safe_on_cpu(cpu, MSR_TURBO_RATIO_LIMIT, low, high) == 0) {
-            success = true;
+        if (get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_PCORE) {
+            if (wrmsr_safe_on_cpu(cpu, MSR_TURBO_RATIO_LIMIT, low, high) == 0) {
+                success = true;
+            }
         }
     }
     return success ? 0 : -EIO;
@@ -192,50 +167,19 @@ ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_privat
     guard(mutex)(&priv->lock);
 
     for_each_online_cpu(cpu) {
-        if (rdmsr_safe_on_cpu(cpu, MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
-            *ratios = ((u64)high << 32) | low;
-            return 0;
+        if (get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_PCORE) {
+            if (rdmsr_safe_on_cpu(cpu, MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
+                *ratios = ((u64)high << 32) | low;
+                return 0;
+            }
         }
     }
     return -EIO;
 }
+
 /*
- * E-Core Active Core Table Manipulation (MSR 0x66C)
+ * E-Core Active Core Table Manipulation (MSR 0x66C / 0x650)
  */
-static void write_ecore_active_ratios_on_cpu(void *info)
-{
-    struct core_ratio_res *res = info;
-    
-    // If another CPU already successfully wrote the MSR, skip
-    if (res->success) return;
-
-    // ADDED: Ensure this only executes on E-cores
-    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_ECORE) {
-        u64 val = res->val;
-        if (wrmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, (u32)val, (u32)(val >> 32)) == 0) {
-            res->success = true;
-        }
-    }
-}
-
-static void read_ecore_active_ratios_on_cpu(void *info)
-{
-    struct core_ratio_res *res = info;
-    u32 low, high;
-    
-    // If another CPU already successfully read the MSR, skip
-    if (res->success) return;
-
-    // ADDED: Ensure this only executes on E-cores
-    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_ECORE) {
-        if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
-            res->val = ((u64)high << 32) | low;
-            res->success = true;
-        }
-    }
-}
-
-/* Ensure writes target the correct MSR found during read */
 ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
 {
     int cpu;
@@ -256,10 +200,6 @@ ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_priva
     return success ? 0 : -EIO;
 }
 
-/* 
- * Refined Skymont/Arrow Lake E-core Probe
- * This ensures we don't grab P-core registers by mistake.
- */
 ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios)
 {
     int cpu;
@@ -268,7 +208,6 @@ ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_privat
     guard(mutex)(&priv->lock);
 
     for_each_online_cpu(cpu) {
-        // Force the loop to ignore P-cores (0-7) and only probe E-cores (8-23)
         if (get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_ECORE) {
             
             // Try standard Atom MSR (0x66C)
