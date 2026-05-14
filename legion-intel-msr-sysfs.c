@@ -372,9 +372,62 @@ static ssize_t core_ratio_limit_store(struct device *dev, struct device_attribut
     return count;
 }
 
+/*
+ * P-Core V/F Point Offset 
+ */
+static ssize_t pcore_vfpoint_offset_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct legion_data *priv = dev_get_drvdata(dev);
+    if (!priv) return -ENODEV;
+    
+    return legion_intel_msr_pcore_vfpoint_offset_show(&priv->intel_msr_private, buf);
+}
+
+static ssize_t pcore_vfpoint_offset_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct legion_data *priv = dev_get_drvdata(dev);
+    if (!priv) return -ENODEV;
+    
+    ssize_t ret = legion_intel_msr_pcore_vfpoint_offset_store(&priv->intel_msr_private, buf, count);
+    
+    // Optional: Send a uevent to notify userspace (like a GUI tool) of the change
+    if (ret > 0) {
+        send_event(dev, LENOVO_INTEL_MSR_PLANE_CPU, 0); // Reusing CPU plane event for simplicity
+    }
+    
+    return ret;
+}
+
+/*
+ * E-Core V/F Point Offset 
+ */
+static ssize_t ecore_vfpoint_offset_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct legion_data *priv = dev_get_drvdata(dev);
+    if (!priv) return -ENODEV;
+    
+    return legion_intel_msr_ecore_vfpoint_offset_show(&priv->intel_msr_private, buf);
+}
+
+static ssize_t ecore_vfpoint_offset_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct legion_data *priv = dev_get_drvdata(dev);
+    if (!priv) return -ENODEV;
+    
+    ssize_t ret = legion_intel_msr_ecore_vfpoint_offset_store(&priv->intel_msr_private, buf, count);
+    
+    if (ret > 0) {
+        send_event(dev, LENOVO_INTEL_MSR_PLANE_CPU, 0); 
+    }
+    
+    return ret;
+}
+
 static DEVICE_ATTR_RW(pcore_active_ratios);
 static DEVICE_ATTR_RW(ecore_active_ratios);
 static DEVICE_ATTR_RW(core_ratio_limit);
+static DEVICE_ATTR_RW(pcore_vfpoint_offset);
+static DEVICE_ATTR_RW(ecore_vfpoint_offset);
 // end
 
 static ssize_t cpu_max_undervolt_show(struct device *dev,struct device_attribute *attr, char *buf)
@@ -621,6 +674,8 @@ static struct attribute *legion_intel_msr_sysfs_attributes[]  = {
 		&dev_attr_pcore_active_ratios.attr,
 		&dev_attr_ecore_active_ratios.attr,
 		&dev_attr_core_ratio_limit.attr,
+		&dev_attr_pcore_vfpoint_offset.attr,
+        &dev_attr_ecore_vfpoint_offset.attr,
 		// end
 
 	    &dev_attr_cpu_max_undervolt.attr,

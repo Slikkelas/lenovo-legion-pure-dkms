@@ -29,6 +29,9 @@
 // Intel Hybrid Core Types (CPUID Leaf 0x1A)
 #define INTEL_HYBRID_CORE_TYPE_PCORE 0x40
 #define INTEL_HYBRID_CORE_TYPE_ECORE 0x20
+// Domain definitions (MSR 0x150 Mailbox)
+#define OC_DOMAIN_PCORE 0
+#define OC_DOMAIN_ECORE 4 // E-cores (Atom L2) typically map to domain 4 on hybrid architectures
 // end
 
 /*
@@ -40,6 +43,18 @@ struct read_msr_data {
     int error;
 };
 
+// Added by Slikkelas
+/* 
+ * V/F Point Data Structure 
+ */
+struct vfpoint_data {
+    int domain;
+    int vf_point;
+    int offset_uv; // Note: Handled as mV based on your earlier Slikkelas modifications
+    u64 result;
+    int error;
+};
+// end
 
 /*
  * Convert microvolts offset to MSR format
@@ -298,6 +313,149 @@ ssize_t legion_intel_msr_get_per_core_ratio(struct legion_intel_msr_private *pri
     if (data.target_ratio_human == 0) return -EIO;
     *ratio = data.target_ratio_human;
     return 0;
+}
+
+/*
+ * Write V/F Point Offset via OC Mailbox
+ */
+static void write_vfpoint_offset_on_cpu(void *info)
+{
+    struct vfpoint_data *data = info;
+    const u32 offset_encoded = uv_to_msr(data->offset_uv);
+
+    // MSR 0x150 format for V/F point offset:
+    // [63]    = Busy bit (set to 1 to initiate command)
+    // [47:40] = Domain/Plane ID
+    // [39:32] = Command (0x11 = write voltage offset)
+    // [31:21] = Voltage offset (11-bit signed, two's complement)
+    // [20:0]  = V/F point index (Injected into bits [15:8])
+    const u64 msr_val = ((u64)1 << 63) |
+                        ((u64)(data->domain & 0xFF) << 40) |
+                        ((u64)0x11 << 32) |
+                        ((u64)(offset_encoded & 0x7FF) << 21) |
+                        ((u64)(data->vf_point & 0xFF) << 8);
+
+    wrmsr_safe(MSR_VOLTAGE_OFFSET, (const u32)msr_val, (const u32)(msr_val >> 32));
+}
+
+/*
+ * Read V/F Point Offset via OC Mailbox
+ */
+static void read_vfpoint_offset_on_cpu(void *info)
+{
+    struct vfpoint_data *data = info;
+    u32 low = 0, high = 0;
+
+    // Command 0x10 = read voltage offset
+    const u64 msr_val = ((u64)1 << 63) |
+                        ((u64)(data->domain & 0xFF) << 40) |
+                        ((u64)0x10 << 32) |
+                        ((u64)(data->vf_point & 0xFF) << 8);
+
+    int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
+    if (err) {
+        data->error = err;
+        return;
+    }
+
+    udelay(10); // Small delay for mailbox to process
+
+    err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
+    if (err) {
+        data->error = err;
+        return;
+    }
+
+    data->result = ((u64)high << 32) | low;
+    data->error = 0;
+}
+
+/*
+ * P-Core V/F Point Sysfs Show & Store
+ */
+ssize_t legion_intel_msr_pcore_vfpoint_offset_show(struct legion_intel_msr_private *priv, char *buf)
+{
+    ssize_t len = 0;
+    guard(mutex)(&priv->lock);
+
+    // P-Cores typically have up to 15 V/F points on Arrow Lake
+    for (int i = 1; i <= 15; i++) {
+        struct vfpoint_data data = { .domain = OC_DOMAIN_PCORE, .vf_point = i, .error = -1 };
+        smp_call_function_single(0, read_vfpoint_offset_on_cpu, &data, 1);
+        
+        if (!data.error) {
+            int offset_mv = msr_to_uv((u32)data.result);
+            len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
+        }
+    }
+    return len;
+}
+
+ssize_t legion_intel_msr_pcore_vfpoint_offset_store(struct legion_intel_msr_private *priv, const char *buf, size_t count)
+{
+    int vf_point, offset_mv;
+    
+    // Expects input in the format: "<Point> <Offset>" (e.g., "6 -30")
+    if (sscanf(buf, "%d %d", &vf_point, &offset_mv) != 2)
+        return -EINVAL;
+
+    if (vf_point < 1 || vf_point > 15) 
+        return -EINVAL; 
+
+    struct vfpoint_data data = { 
+        .domain = OC_DOMAIN_PCORE, 
+        .vf_point = vf_point, 
+        .offset_uv = offset_mv 
+    };
+    
+    guard(mutex)(&priv->lock);
+    on_each_cpu(write_vfpoint_offset_on_cpu, &data, 1);
+
+    return count;
+}
+
+/*
+ * E-Core V/F Point Sysfs Show & Store
+ */
+ssize_t legion_intel_msr_ecore_vfpoint_offset_show(struct legion_intel_msr_private *priv, char *buf)
+{
+    ssize_t len = 0;
+    guard(mutex)(&priv->lock);
+
+    // E-Cores have 7 V/F points. The 7th is mapped to the OC ratio.
+    for (int i = 1; i <= 7; i++) {
+        struct vfpoint_data data = { .domain = OC_DOMAIN_ECORE, .vf_point = i, .error = -1 };
+        smp_call_function_single(0, read_vfpoint_offset_on_cpu, &data, 1);
+        
+        if (!data.error) {
+            int offset_mv = msr_to_uv((u32)data.result);
+            len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
+        }
+    }
+    return len;
+}
+
+ssize_t legion_intel_msr_ecore_vfpoint_offset_store(struct legion_intel_msr_private *priv, const char *buf, size_t count)
+{
+    int vf_point, offset_mv;
+    
+    // Expects input in the format: "<Point> <Offset>" (e.g., "7 -15")
+    if (sscanf(buf, "%d %d", &vf_point, &offset_mv) != 2)
+        return -EINVAL;
+
+    if (vf_point < 1 || vf_point > 7) 
+        return -EINVAL;
+
+    struct vfpoint_data data = { 
+        .domain = OC_DOMAIN_ECORE, 
+        .vf_point = vf_point, 
+        .offset_uv = offset_mv 
+    };
+    
+    guard(mutex)(&priv->lock);
+    on_each_cpu(write_vfpoint_offset_on_cpu, &data, 1);
+
+    return count;
 }
 // end
 
