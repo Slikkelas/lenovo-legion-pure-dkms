@@ -192,9 +192,12 @@ static void write_ecore_active_ratios_on_cpu(void *info)
     // If another CPU already successfully wrote the MSR, skip
     if (res->success) return;
 
-    u64 val = res->val;
-    if (wrmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, (u32)val, (u32)(val >> 32)) == 0) {
-        res->success = true;
+    // ADDED: Ensure this only executes on E-cores
+    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_ECORE) {
+        u64 val = res->val;
+        if (wrmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, (u32)val, (u32)(val >> 32)) == 0) {
+            res->success = true;
+        }
     }
 }
 
@@ -206,9 +209,12 @@ static void read_ecore_active_ratios_on_cpu(void *info)
     // If another CPU already successfully read the MSR, skip
     if (res->success) return;
 
-    if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
-        res->val = ((u64)high << 32) | low;
-        res->success = true;
+    // ADDED: Ensure this only executes on E-cores
+    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_ECORE) {
+        if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
+            res->val = ((u64)high << 32) | low;
+            res->success = true;
+        }
     }
 }
 
