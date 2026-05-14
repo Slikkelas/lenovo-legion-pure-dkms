@@ -17,6 +17,8 @@
 #include <linux/delay.h>
 #include <linux/cpu.h>
 #include <asm/cpu_device_id.h>
+// Added by Slikkelas
+#include <linux/cpufreq.h>
 
 
 #define MSR_VOLTAGE_OFFSET 0x150
@@ -159,11 +161,12 @@ static void read_ecore_active_ratios_on_cpu(void *info)
     struct ecore_read_res *res = info;
     u32 low, high;
     
-    // If the hardware answers, mark success (even if the value is 0)
-    if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
-        res->val = ((u64)high << 32) | low;
-        res->success = true;
-    }
+    // Only mark success if the hardware answers AND the value is non-zero.
+    // This prevents P-cores from returning a false-positive 0.
+        if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0 && (low != 0 || high != 0)) {
+            res->val = ((u64)high << 32) | low;
+            res->success = true;
+        }
 }
 
 ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
@@ -194,37 +197,60 @@ ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_privat
 
 /* Per-Core Boost Ratio Manipulation via raw HWP (MSR 0x774) */
 struct hwp_ratio_data {
-    int ratio;
+    int cpu;
+    int target_ratio_human;
 };
 
 static void write_per_core_ratio_on_cpu(void *info)
 {
     struct hwp_ratio_data *data = info;
-    u32 req_low, req_high;
-    
-    if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
-        req_low &= ~(0xFF << 8); // Clear bits 15:8 (Maximum Performance)
-        req_low |= ((data->ratio & 0xFF) << 8); // Inject raw hardware limit
-        wrmsr_safe(MSR_HWP_REQUEST, req_low, req_high);
+    u32 cap_low, cap_high, req_low, req_high;
+    unsigned int max_freq_khz = cpufreq_quick_get_max(data->cpu); // e.g. 4700000
+
+    if (max_freq_khz == 0) return;
+
+    if (rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0) {
+        u32 hwp_max = cap_low & 0xFF; // Abstract hardware max (e.g. 65)
+        u32 human_max_ratio = max_freq_khz / 100000; // Translate to human ratio (47)
+        
+        // Scale the user's ratio (e.g. 40) into the abstract HWP limit (e.g. 55)
+        u32 scaled_hwp = DIV_ROUND_CLOSEST(data->target_ratio_human * hwp_max, human_max_ratio);
+        
+        if (scaled_hwp > hwp_max) scaled_hwp = hwp_max;
+
+        if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
+            req_low &= ~(0xFF << 8); // Clear bits 15:8 (Maximum Performance)
+            req_low |= ((scaled_hwp & 0xFF) << 8); // Inject scaled hardware limit
+            wrmsr_safe(MSR_HWP_REQUEST, req_low, req_high);
+        }
     }
 }
 
 static void read_per_core_ratio_on_cpu(void *info)
 {
-    u32 *result = info;
-    u32 req_low, req_high;
-    
-    if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
-        *result = (req_low >> 8) & 0xFF; // Fetch raw hardware limit
-    } else {
-        *result = 0;
+    struct hwp_ratio_data *data = info;
+    u32 cap_low, cap_high, req_low, req_high;
+    unsigned int max_freq_khz = cpufreq_quick_get_max(data->cpu); // e.g. 4700000
+
+    data->target_ratio_human = 0; // Default
+
+    if (max_freq_khz > 0 && rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0) {
+        u32 hwp_max = cap_low & 0xFF; // Abstract hardware max (e.g. 65)
+        u32 human_max_ratio = max_freq_khz / 100000; // Translate to human ratio (47)
+
+        if (hwp_max > 0 && rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
+            u32 active_hwp = (req_low >> 8) & 0xFF; 
+            
+            // Translate the abstract HWP back to a human ratio
+            data->target_ratio_human = DIV_ROUND_CLOSEST(active_hwp * human_max_ratio, hwp_max);
+        }
     }
 }
 
 ssize_t legion_intel_msr_set_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int ratio)
 {
-    struct hwp_ratio_data data = { .ratio = ratio };
-    if (ratio < 8 || ratio > 255) return -EINVAL; // Allow raw limits up to 0xFF
+    struct hwp_ratio_data data = { .cpu = cpu, .target_ratio_human = ratio };
+    if (ratio < 8 || ratio > 120) return -EINVAL; 
     
     guard(mutex)(&priv->lock);
     smp_call_function_single(cpu, write_per_core_ratio_on_cpu, &data, 1);
@@ -233,12 +259,12 @@ ssize_t legion_intel_msr_set_per_core_ratio(struct legion_intel_msr_private *pri
 
 ssize_t legion_intel_msr_get_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int *ratio)
 {
-    u32 result = 0;
+    struct hwp_ratio_data data = { .cpu = cpu, .target_ratio_human = 0 };
     guard(mutex)(&priv->lock);
-    smp_call_function_single(cpu, read_per_core_ratio_on_cpu, &result, 1);
+    smp_call_function_single(cpu, read_per_core_ratio_on_cpu, &data, 1);
     
-    if (result == 0) return -EIO;
-    *ratio = (int)result;
+    if (data.target_ratio_human == 0) return -EIO;
+    *ratio = data.target_ratio_human;
     return 0;
 }
 // end

@@ -311,20 +311,26 @@ static ssize_t ecore_active_ratios_store(struct device *dev, struct device_attri
     if (!priv) return -ENODEV;
 
     if (sscanf(buf, "%d %d %d %d %d %d %d %d", &r[0], &r[1], &r[2], &r[3], &r[4], &r[5], &r[6], &r[7]) != 8) {
-        dev_err(dev, "Invalid format. Provide 8 numbers for 1C to 8C active limits.\n");
+        dev_err(dev, "Invalid format. Provide 8 numbers for active limits.\n");
         return -EINVAL;
     }
 
     for (int i = 0; i < 8; i++) {
         if ((r[i] < 8 && r[i] != 0) || r[i] > 255) return -EINVAL;
+        
+        // CRITICAL: Intel requires ratios to be monotonically decreasing or equal.
+        // If r[i] is greater than the previous core count's ratio, hardware will reject it.
+        if (i > 0 && r[i] > r[i-1] && r[i] != 0) {
+            dev_err(dev, "Invalid ratios. Values must be monotonically decreasing (e.g., 50 50 48 48...).\n");
+            return -EINVAL;
+        }
+        
         msr_val |= ((u64)r[i] << (i * 8));
     }
 
     if (legion_intel_msr_apply_ecore_active_ratios(&priv->intel_msr_private, msr_val) < 0) return -EIO;
     return count;
 }
-
-static DEVICE_ATTR_RW(ecore_active_ratios);
 
 /* Per-Core specific ratio targeting */
 static ssize_t core_ratio_limit_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -367,6 +373,7 @@ static ssize_t core_ratio_limit_store(struct device *dev, struct device_attribut
 }
 
 static DEVICE_ATTR_RW(pcore_active_ratios);
+static DEVICE_ATTR_RW(ecore_active_ratios);
 static DEVICE_ATTR_RW(core_ratio_limit);
 // end
 
