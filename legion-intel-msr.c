@@ -457,6 +457,77 @@ ssize_t legion_intel_msr_ecore_vfpoint_offset_store(struct legion_intel_msr_priv
 
     return count;
 }
+
+/*
+ * Read V/F Point Ratio via OC Mailbox
+ */
+static void read_vfpoint_ratio_on_cpu(void *info)
+{
+    struct vfpoint_data *data = info;
+    u32 low = 0, high = 0;
+
+    // Command 0x12 = read V/F point ratio
+    const u64 msr_val = ((u64)1 << 63) |
+                        ((u64)(data->domain & 0xFF) << 40) |
+                        ((u64)0x12 << 32) |
+                        ((u64)(data->vf_point & 0xFF) << 8);
+
+    int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
+    if (err) {
+        data->error = err;
+        return;
+    }
+
+    udelay(10); // Small delay for mailbox to process
+
+    err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
+    if (err) {
+        data->error = err;
+        return;
+    }
+
+    // The ratio is returned in the lowest 8 bits
+    data->result = low & 0xFF; 
+    data->error = 0;
+}
+
+/*
+ * P-Core V/F Point Freq (Ratio) Sysfs Show
+ */
+ssize_t legion_intel_msr_pcore_vfpoint_freq_show(struct legion_intel_msr_private *priv, char *buf)
+{
+    ssize_t len = 0;
+    guard(mutex)(&priv->lock);
+
+    for (int i = 1; i <= 15; i++) {
+        struct vfpoint_data data = { .domain = OC_DOMAIN_PCORE, .vf_point = i, .error = -1 };
+        smp_call_function_single(0, read_vfpoint_ratio_on_cpu, &data, 1);
+        
+        if (!data.error && data.result > 0) {
+            len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %llu\n", i, data.result);
+        }
+    }
+    return len;
+}
+
+/*
+ * E-Core V/F Point Freq (Ratio) Sysfs Show
+ */
+ssize_t legion_intel_msr_ecore_vfpoint_freq_show(struct legion_intel_msr_private *priv, char *buf)
+{
+    ssize_t len = 0;
+    guard(mutex)(&priv->lock);
+
+    for (int i = 1; i <= 7; i++) {
+        struct vfpoint_data data = { .domain = OC_DOMAIN_ECORE, .vf_point = i, .error = -1 };
+        smp_call_function_single(0, read_vfpoint_ratio_on_cpu, &data, 1);
+        
+        if (!data.error && data.result > 0) {
+            len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %llu\n", i, data.result);
+        }
+    }
+    return len;
+}
 // end
 
 /*
