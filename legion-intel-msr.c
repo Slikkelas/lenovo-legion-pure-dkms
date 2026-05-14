@@ -187,9 +187,14 @@ ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_privat
  */
 static void write_ecore_active_ratios_on_cpu(void *info)
 {
-    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_ECORE) {
-        u64 val = *(u64 *)info;
-        wrmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, (u32)val, (u32)(val >> 32));
+    struct core_ratio_res *res = info;
+    
+    // If another CPU already successfully wrote the MSR, skip
+    if (res->success) return;
+
+    u64 val = res->val;
+    if (wrmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, (u32)val, (u32)(val >> 32)) == 0) {
+        res->success = true;
     }
 }
 
@@ -198,20 +203,31 @@ static void read_ecore_active_ratios_on_cpu(void *info)
     struct core_ratio_res *res = info;
     u32 low, high;
     
-    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_ECORE) {
-        if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
-            res->val = ((u64)high << 32) | low;
-            res->success = true;
-        }
+    // If another CPU already successfully read the MSR, skip
+    if (res->success) return;
+
+    if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
+        res->val = ((u64)high << 32) | low;
+        res->success = true;
     }
 }
 
 ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
 {
+    // Pass the target ratios via res.val, track success via res.success
+    struct core_ratio_res res = { .val = ratios, .success = false };
+    int cpu;
+
     guard(mutex)(&priv->lock);
-    // Broadcasts to all CPUs, but the CPUID check ensures only E-cores apply it
-    on_each_cpu(write_ecore_active_ratios_on_cpu, &ratios, 1);
-    return 0;
+    
+    for_each_online_cpu(cpu) {
+        smp_call_function_single(cpu, write_ecore_active_ratios_on_cpu, &res, 1);
+        if (res.success) {
+            return 0; // Successfully applied
+        }
+    }
+    
+    return -EIO;
 }
 
 ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios)
