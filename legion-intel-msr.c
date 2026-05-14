@@ -19,12 +19,17 @@
 #include <asm/cpu_device_id.h>
 // Added by Slikkelas
 #include <linux/cpufreq.h>
-
+#include <asm/processor.h> // Required for cpuid_count
+// end
 
 #define MSR_VOLTAGE_OFFSET 0x150
 #define MSR_OC_MAILBOX 0x150
 #define MSR_OC_MAILBOX_CMD_READ_VOLTAGE_LIMIT 0x1A
-
+// Added by Slikkelas
+// Intel Hybrid Core Types (CPUID Leaf 0x1A)
+#define INTEL_HYBRID_CORE_TYPE_PCORE 0x40
+#define INTEL_HYBRID_CORE_TYPE_ECORE 0x20
+// end
 
 /*
  * Read voltage offset from specific plane on current CPU
@@ -105,40 +110,76 @@ static ssize_t validate_offset(const struct legion_intel_msr_private *intel_msr_
 
 // Added by Slikkelas
 /*
+ * Helper to dynamically detect the core type executing this code
+ */
+static int get_intel_core_type(void)
+{
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    
+    // Verify the CPU supports Leaf 0x1A (Hybrid Information)
+    if (boot_cpu_data.cpuid_level >= 0x1A) {
+        cpuid_count(0x1A, 0, &eax, &ebx, &ecx, &edx);
+        return (eax >> 24) & 0xFF; // Bits 31:24 define the core type
+    }
+    
+    // Fallback for older non-hybrid architectures
+    return INTEL_HYBRID_CORE_TYPE_PCORE;
+}
+
+// Unified struct for ratio reads
+struct core_ratio_res {
+    u64 val;
+    bool success;
+};
+
+/*
  * P-Core Active Core Table Manipulation (MSR 0x1AD)
  */
 static void write_pcore_active_ratios_on_cpu(void *info)
 {
-    u64 val = *(u64 *)info;
-    wrmsr_safe(MSR_TURBO_RATIO_LIMIT, (u32)val, (u32)(val >> 32));
+    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_PCORE) {
+        u64 val = *(u64 *)info;
+        wrmsr_safe(MSR_TURBO_RATIO_LIMIT, (u32)val, (u32)(val >> 32));
+    }
 }
 
 static void read_pcore_active_ratios_on_cpu(void *info)
 {
-    u64 *result = info;
+    struct core_ratio_res *res = info;
     u32 low, high;
-    if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
-        *result = ((u64)high << 32) | low;
-    } else {
-        *result = 0;
+
+    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_PCORE) {
+        if (rdmsr_safe(MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
+            res->val = ((u64)high << 32) | low;
+            res->success = true;
+        }
     }
 }
 
 ssize_t legion_intel_msr_apply_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
 {
     guard(mutex)(&priv->lock);
-    smp_call_function_single(0, write_pcore_active_ratios_on_cpu, &ratios, 1);
+    // Broadcasts to all CPUs, but the CPUID check ensures only P-cores apply it
+    on_each_cpu(write_pcore_active_ratios_on_cpu, &ratios, 1);
     return 0;
 }
 
 ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios)
 {
-    u64 result = 0;
+    struct core_ratio_res res = { .val = 0, .success = false };
+    int cpu;
+    
     guard(mutex)(&priv->lock);
-    smp_call_function_single(0, read_pcore_active_ratios_on_cpu, &result, 1);
-    if (result == 0) return -EIO;
-    *ratios = result;
-    return 0;
+    
+    for_each_online_cpu(cpu) {
+        smp_call_function_single(cpu, read_pcore_active_ratios_on_cpu, &res, 1);
+        if (res.success) {
+            *ratios = res.val;
+            return 0;
+        }
+    }
+    
+    return -EIO;
 }
 
 /*
@@ -146,40 +187,36 @@ ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_privat
  */
 static void write_ecore_active_ratios_on_cpu(void *info)
 {
-    u64 val = *(u64 *)info;
-    wrmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, (u32)val, (u32)(val >> 32));
+    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_ECORE) {
+        u64 val = *(u64 *)info;
+        wrmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, (u32)val, (u32)(val >> 32));
+    }
 }
-
-// Struct to prevent the "zero-value" bug
-struct ecore_read_res {
-    u64 val;
-    bool success;
-};
 
 static void read_ecore_active_ratios_on_cpu(void *info)
 {
-    struct ecore_read_res *res = info;
+    struct core_ratio_res *res = info;
     u32 low, high;
     
-    // Only mark success if the hardware answers AND the value is non-zero.
-    // This prevents P-cores from returning a false-positive 0.
-        if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0 && (low != 0 || high != 0)) {
+    if (get_intel_core_type() == INTEL_HYBRID_CORE_TYPE_ECORE) {
+        if (rdmsr_safe(MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
             res->val = ((u64)high << 32) | low;
             res->success = true;
         }
+    }
 }
 
 ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
 {
     guard(mutex)(&priv->lock);
-    // E-core registers are module-scoped, broadcast to hit all clusters
+    // Broadcasts to all CPUs, but the CPUID check ensures only E-cores apply it
     on_each_cpu(write_ecore_active_ratios_on_cpu, &ratios, 1);
     return 0;
 }
 
 ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios)
 {
-    struct ecore_read_res res = { .val = 0, .success = false };
+    struct core_ratio_res res = { .val = 0, .success = false };
     int cpu;
     
     guard(mutex)(&priv->lock);
