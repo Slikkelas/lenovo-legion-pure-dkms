@@ -486,8 +486,9 @@ static void read_vfpoint_ratio_on_cpu(void *info)
         return;
     }
 
-    // The ratio is returned in the lowest 8 bits
-    data->result = low & 0xFF; 
+    // Bits [7:0] hold the command status (0 = success).
+    // The actual ratio payload is returned in bits [31:24].
+    data->result = (low >> 24) & 0xFF; 
     data->error = 0;
 }
 
