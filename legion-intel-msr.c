@@ -158,30 +158,36 @@ static void read_pcore_active_ratios_on_cpu(void *info)
 
 ssize_t legion_intel_msr_apply_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
 {
+    int cpu;
+    bool success = false;
+    u32 low = (u32)ratios;
+    u32 high = (u32)(ratios >> 32);
+
     guard(mutex)(&priv->lock);
-    // Broadcasts to all CPUs, but the CPUID check ensures only P-cores apply it
-    on_each_cpu(write_pcore_active_ratios_on_cpu, &ratios, 1);
-    return 0;
+
+    for_each_online_cpu(cpu) {
+        if (wrmsr_safe_on_cpu(cpu, MSR_TURBO_RATIO_LIMIT, low, high) == 0) {
+            success = true;
+        }
+    }
+    return success ? 0 : -EIO;
 }
 
 ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios)
 {
-    struct core_ratio_res res = { .val = 0, .success = false };
     int cpu;
-    
+    u32 low, high;
+
     guard(mutex)(&priv->lock);
-    
+
     for_each_online_cpu(cpu) {
-        smp_call_function_single(cpu, read_pcore_active_ratios_on_cpu, &res, 1);
-        if (res.success) {
-            *ratios = res.val;
+        if (rdmsr_safe_on_cpu(cpu, MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
+            *ratios = ((u64)high << 32) | low;
             return 0;
         }
     }
-    
     return -EIO;
 }
-
 /*
  * E-Core Active Core Table Manipulation (MSR 0x66C)
  */
@@ -220,37 +226,47 @@ static void read_ecore_active_ratios_on_cpu(void *info)
 
 ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
 {
-    // Pass the target ratios via res.val, track success via res.success
-    struct core_ratio_res res = { .val = ratios, .success = false };
     int cpu;
+    bool success = false;
+    u32 low = (u32)ratios;
+    u32 high = (u32)(ratios >> 32);
 
     guard(mutex)(&priv->lock);
-    
+
     for_each_online_cpu(cpu) {
-        smp_call_function_single(cpu, write_ecore_active_ratios_on_cpu, &res, 1);
-        if (res.success) {
-            return 0; // Successfully applied
+        // Broadcasts to all valid E-cores in the module
+        if (wrmsr_safe_on_cpu(cpu, MSR_ATOM_CORE_TURBO_RATIOS, low, high) == 0) {
+            success = true;
         }
     }
-    
-    return -EIO;
+    return success ? 0 : -EIO;
 }
 
 ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios)
 {
-    struct core_ratio_res res = { .val = 0, .success = false };
     int cpu;
-    
+    u32 low, high;
+
     guard(mutex)(&priv->lock);
-    
+
+    // Primary Probe: Check standard Gracemont/Skymont E-core MSR
     for_each_online_cpu(cpu) {
-        smp_call_function_single(cpu, read_ecore_active_ratios_on_cpu, &res, 1);
-        if (res.success) {
-            *ratios = res.val;
+        if (rdmsr_safe_on_cpu(cpu, MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
+            *ratios = ((u64)high << 32) | low;
             return 0;
         }
     }
-    
+
+    // Diagnostic Fallback: Try 0x1AE if 0x66C fails entirely
+    for_each_online_cpu(cpu) {
+        if (rdmsr_safe_on_cpu(cpu, 0x1AE, &low, &high) == 0) {
+            pr_info("legion-intel-msr: DIAGNOSTIC - E-core ratios found on 0x1AE instead of 0x66C on CPU %d\n", cpu);
+            *ratios = ((u64)high << 32) | low;
+            return 0;
+        }
+    }
+
+    pr_err("legion-intel-msr: Failed to read E-core ratios (Checked 0x66C and 0x1AE)\n");
     return -EIO;
 }
 
