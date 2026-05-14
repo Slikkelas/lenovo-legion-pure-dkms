@@ -466,10 +466,11 @@ static void read_vfpoint_ratio_on_cpu(void *info)
     struct vfpoint_data *data = info;
     u32 low = 0, high = 0;
 
-    // Command 0x12 = read V/F point ratio
+    // Command 0x10 (Read Voltage Offset / V/F Point)
+    // The PCU returns BOTH the offset and the frequency ratio.
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
-                        ((u64)0x12 << 32) |
+                        ((u64)0x10 << 32) |
                         ((u64)(data->vf_point & 0xFF) << 8);
 
     int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
@@ -487,8 +488,14 @@ static void read_vfpoint_ratio_on_cpu(void *info)
     }
 
     // Bits [7:0] hold the command status (0 = success).
-    // The actual ratio payload is returned in bits [31:24].
-    data->result = (low >> 24) & 0xFF; 
+    // If the PCU rejects the command or the point doesn't exist, exit.
+    if ((low & 0xFF) != 0) {
+        data->error = -(low & 0xFF);
+        return;
+    }
+
+    // The actual frequency ratio is returned in bits [15:8].
+    data->result = (low >> 8) & 0xFF; 
     data->error = 0;
 }
 
