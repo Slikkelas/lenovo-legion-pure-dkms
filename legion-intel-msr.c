@@ -112,17 +112,28 @@ static ssize_t validate_offset(const struct legion_intel_msr_private *intel_msr_
 /*
  * Helper to dynamically detect the core type executing this code
  */
-static int get_intel_core_type(void)
+
+/* Helper struct for CPUID SMP calls */
+struct cpuid_query {
+    unsigned int eax, ebx, ecx, edx;
+};
+
+/* Named helper function for smp_call (Replaces the C++ lambda) */
+static void get_cpuid_1a_work(void *info)
 {
-    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-    
-    // Verify the CPU supports Leaf 0x1A (Hybrid Information)
-    if (boot_cpu_data.cpuid_level >= 0x1A) {
-        cpuid_count(0x1A, 0, &eax, &ebx, &ecx, &edx);
-        return (eax >> 24) & 0xFF; // Bits 31:24 define the core type
+    struct cpuid_query *res = info;
+    cpuid_count(0x1A, 0, &res->eax, &res->ebx, &res->ecx, &res->edx);
+}
+
+/* Core Type Detection */
+static int get_intel_core_type_on_cpu(int cpu)
+{
+    struct cpuid_query res;
+    // Check if Leaf 0x1A is supported
+    if (cpuid_eax(0) >= 0x1A) {
+        smp_call_function_single(cpu, get_cpuid_1a_work, &res, 1);
+        return (res.eax >> 24) & 0xFF;
     }
-    
-    // Fallback for older non-hybrid architectures
     return INTEL_HYBRID_CORE_TYPE_PCORE;
 }
 
@@ -224,6 +235,7 @@ static void read_ecore_active_ratios_on_cpu(void *info)
     }
 }
 
+/* Ensure writes target the correct MSR found during read */
 ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
 {
     int cpu;
@@ -234,14 +246,20 @@ ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_priva
     guard(mutex)(&priv->lock);
 
     for_each_online_cpu(cpu) {
-        // Broadcasts to all valid E-cores in the module
-        if (wrmsr_safe_on_cpu(cpu, MSR_ATOM_CORE_TURBO_RATIOS, low, high) == 0) {
+        if (get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_ECORE) {
+            // Write to both potential registers; unsupported ones will be ignored safely
+            wrmsr_safe_on_cpu(cpu, MSR_ATOM_CORE_TURBO_RATIOS, low, high);
+            wrmsr_safe_on_cpu(cpu, 0x650, low, high);
             success = true;
         }
     }
     return success ? 0 : -EIO;
 }
 
+/* 
+ * Refined Skymont/Arrow Lake E-core Probe
+ * This ensures we don't grab P-core registers by mistake.
+ */
 ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios)
 {
     int cpu;
@@ -249,24 +267,24 @@ ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_privat
 
     guard(mutex)(&priv->lock);
 
-    // Primary Probe: Check standard Gracemont/Skymont E-core MSR
     for_each_online_cpu(cpu) {
-        if (rdmsr_safe_on_cpu(cpu, MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
-            *ratios = ((u64)high << 32) | low;
-            return 0;
+        // Force the loop to ignore P-cores (0-7) and only probe E-cores (8-23)
+        if (get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_ECORE) {
+            
+            // Try standard Atom MSR (0x66C)
+            if (rdmsr_safe_on_cpu(cpu, MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
+                *ratios = ((u64)high << 32) | low;
+                return 0;
+            }
+            
+            // Try Skymont/Arrow Lake specific MSR (0x650)
+            if (rdmsr_safe_on_cpu(cpu, 0x650, &low, &high) == 0) {
+                *ratios = ((u64)high << 32) | low;
+                return 0;
+            }
         }
     }
 
-    // Diagnostic Fallback: Try 0x1AE if 0x66C fails entirely
-    for_each_online_cpu(cpu) {
-        if (rdmsr_safe_on_cpu(cpu, 0x1AE, &low, &high) == 0) {
-            pr_info("legion-intel-msr: DIAGNOSTIC - E-core ratios found on 0x1AE instead of 0x66C on CPU %d\n", cpu);
-            *ratios = ((u64)high << 32) | low;
-            return 0;
-        }
-    }
-
-    pr_err("legion-intel-msr: Failed to read E-core ratios (Checked 0x66C and 0x1AE)\n");
     return -EIO;
 }
 
