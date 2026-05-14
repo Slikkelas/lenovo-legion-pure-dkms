@@ -479,22 +479,31 @@ static void read_vfpoint_ratio_on_cpu(void *info)
         return;
     }
 
-    udelay(10); // Small delay for mailbox to process
+    // Wait for the PCU to clear the busy bit (Bit 63 / Bit 31 of high)
+    // Polling is safer for hardware than a static udelay.
+    int timeout = 100;
+    do {
+        udelay(10);
+        err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
+        if (err) {
+            data->error = err;
+            return;
+        }
+    } while ((high & 0x80000000) && --timeout);
 
-    err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
-    if (err) {
-        data->error = err;
+    if (timeout == 0) {
+        data->error = -ETIMEDOUT;
         return;
     }
 
-    // Bits [7:0] hold the command status (0 = success).
-    // If the PCU rejects the command or the point doesn't exist, exit.
-    if ((low & 0xFF) != 0) {
-        data->error = -(low & 0xFF);
+    // CRITICAL FIX: The command status is in bits [39:32], which is the lowest byte of 'high'.
+    // 0 = success, anything else is a PCU rejection.
+    if ((high & 0xFF) != 0) {
+        data->error = -(high & 0xFF);
         return;
     }
 
-    // The actual frequency ratio is returned in bits [15:8].
+    // The actual frequency ratio is returned in bits [15:8] of the lower 32 bits.
     data->result = (low >> 8) & 0xFF; 
     data->error = 0;
 }
