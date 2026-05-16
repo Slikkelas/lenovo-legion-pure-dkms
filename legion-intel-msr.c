@@ -451,8 +451,8 @@ static void read_vfpoint_ratio_on_cpu(void *info)
         return;
     }
 
-    // The actual frequency ratio is returned in bits [7:0] of the lower 32 bits
-    data->result = low & 0xFF;
+    // The actual frequency ratio is returned in bits [15:8] of the lower 32 bits
+    data->result = (low >> 8) & 0xFF;
     data->error = 0;
 }
 
