@@ -326,14 +326,14 @@ static void write_vfpoint_offset_on_cpu(void *info)
     // MSR 0x150 format for V/F point offset:
     // [63]    = Busy bit (set to 1 to initiate command)
     // [47:40] = Domain/Plane ID
-    // [39:32] = Command (0x11 = write voltage offset)
+    // [39:32] = Command (0x14 = write V/F point offset)
     // [31:21] = Voltage offset (11-bit signed, two's complement)
-    // [20:0]  = V/F point index (Injected into bits [15:8])
+    // [7:0]   = V/F point index
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
-                        ((u64)0x11 << 32) |
+                        ((u64)0x14 << 32) |
                         ((u64)(offset_encoded & 0x7FF) << 21) |
-                        ((u64)(data->vf_point & 0xFF) << 8);
+                        ((u64)(data->vf_point & 0xFF)); // Corrected bit alignment
 
     wrmsr_safe(MSR_VOLTAGE_OFFSET, (const u32)msr_val, (const u32)(msr_val >> 32));
 }
@@ -346,11 +346,11 @@ static void read_vfpoint_offset_on_cpu(void *info)
     struct vfpoint_data *data = info;
     u32 low = 0, high = 0;
 
-    // Command 0x10 = read voltage offset
+    // Command 0x13 = read V/F point offset
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
-                        ((u64)0x10 << 32) |
-                        ((u64)(data->vf_point & 0xFF) << 8);
+                        ((u64)0x13 << 32) |
+                        ((u64)(data->vf_point & 0xFF)); // Corrected bit alignment
 
     int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
     if (err) {
@@ -378,11 +378,11 @@ static void read_vfpoint_ratio_on_cpu(void *info)
     struct vfpoint_data *data = info;
     u32 low = 0, high = 0;
 
-    // Command 0x10 (Read Voltage Offset / V/F Point)
+    // Command 0x12 = read V/F point ratio
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
-                        ((u64)0x10 << 32) |
-                        ((u64)(data->vf_point & 0xFF) << 8);
+                        ((u64)0x12 << 32) |
+                        ((u64)(data->vf_point & 0xFF)); // Corrected bit alignment
 
     int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
     if (err) {
@@ -411,8 +411,8 @@ static void read_vfpoint_ratio_on_cpu(void *info)
         return;
     }
 
-    // The actual frequency ratio is returned in bits [15:8] of the lower 32 bits.
-    data->result = (low >> 8) & 0xFF; 
+    // The actual frequency ratio is returned in bits [7:0] of the lower 32 bits.
+    data->result = low & 0xFF; // Corrected extraction logic
     data->error = 0;
 }
 
