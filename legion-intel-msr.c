@@ -329,12 +329,12 @@ static void write_vfpoint_offset_on_cpu(void *info)
     // [47:40] = Domain/Plane ID
     // [39:32] = Command (0x14 = write V/F point offset)
     // [31:21] = Voltage offset (11-bit signed, two's complement)
-    // [7:0]   = V/F point index
+    // [15:8]  = V/F point index (RESTORED SHIFT)
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
                         ((u64)0x14 << 32) |
                         ((u64)(offset_encoded & 0x7FF) << 21) |
-                        ((u64)(data->vf_point & 0xFF)); // Shift removed
+                        ((u64)(data->vf_point & 0xFF) << 8); // <-- Added << 8 shift here
 
     int err = wrmsr_safe(MSR_VOLTAGE_OFFSET, (const u32)msr_val, (const u32)(msr_val >> 32));
     if (err) {
@@ -378,7 +378,7 @@ static void read_vfpoint_offset_on_cpu(void *info)
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
                         ((u64)0x13 << 32) |
-                        ((u64)(data->vf_point & 0xFF)); // Shift removed
+                        ((u64)(data->vf_point & 0xFF) << 8); // <-- Added << 8 shift here
 
     int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
     if (err) {
@@ -423,7 +423,7 @@ static void read_vfpoint_ratio_on_cpu(void *info)
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
                         ((u64)0x12 << 32) |
-                        ((u64)(data->vf_point & 0xFF)); // Shift removed
+                        ((u64)(data->vf_point & 0xFF) << 8); // <-- Added << 8 shift here
 
     int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
     if (err) {
