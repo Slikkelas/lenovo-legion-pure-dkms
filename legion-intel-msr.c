@@ -329,12 +329,12 @@ static void write_vfpoint_offset_on_cpu(void *info)
     // [47:40] = Domain/Plane ID
     // [39:32] = Command (0x14 = write V/F point offset)
     // [31:21] = Voltage offset (11-bit signed, two's complement)
-    // [15:8]  = V/F point index (RESTORED SHIFT)
+    // [7:0]  = V/F point index
     const u64 msr_val = ((u64)1 << 63) |
-                        ((u64)(data->domain & 0xFF) << 40) |
-                        ((u64)0x14 << 32) |
-                        ((u64)(offset_encoded & 0x7FF) << 21) |
-                        ((u64)(data->vf_point & 0xFF) << 8); // <-- Added << 8 shift here
+                            ((u64)(data->domain & 0xFF) << 40) |
+                            ((u64)0x14 << 32) |
+                            ((u64)(offset_encoded & 0x7FF) << 21) |
+                            ((u64)(data->vf_point & 0xFF));
 
     int err = wrmsr_safe(MSR_VOLTAGE_OFFSET, (const u32)msr_val, (const u32)(msr_val >> 32));
     if (err) {
@@ -376,9 +376,9 @@ static void read_vfpoint_offset_on_cpu(void *info)
 
     // Command 0x15 = read V/F point offset (Fixed: was 0x13)
     const u64 msr_val = ((u64)1 << 63) |
-                        ((u64)(data->domain & 0xFF) << 40) |
-                        ((u64)0x15 << 32) |                       // <-- CHANGED from 0x13 to 0x15
-                        ((u64)(data->vf_point & 0xFF) << 8);
+                            ((u64)(data->domain & 0xFF) << 40) |
+                            ((u64)0x15 << 32) |                       
+                            ((u64)(data->vf_point & 0xFF));
 
     int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
     if (err) {
@@ -421,9 +421,9 @@ static void read_vfpoint_ratio_on_cpu(void *info)
 
     // Command 0x12 = read V/F point ratio
     const u64 msr_val = ((u64)1 << 63) |
-                        ((u64)(data->domain & 0xFF) << 40) |
-                        ((u64)0x12 << 32) |
-                        ((u64)(data->vf_point & 0xFF) << 8); // <-- Added << 8 shift here
+                            ((u64)(data->domain & 0xFF) << 40) |
+                            ((u64)0x12 << 32) |
+                            ((u64)(data->vf_point & 0xFF));
 
     int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
     if (err) {
@@ -464,7 +464,6 @@ ssize_t legion_intel_msr_pcore_vfpoint_offset_show(struct legion_intel_msr_priva
     ssize_t len = 0;
     guard(mutex)(&priv->lock);
 
-    // P-Cores typically have up to 15 V/F points on Arrow Lake
     for (int i = 1; i <= 15; i++) {
         struct vfpoint_data data = { .domain = OC_DOMAIN_PCORE, .vf_point = i, .error = -1 };
         smp_call_function_single(0, read_vfpoint_offset_on_cpu, &data, 1);
@@ -472,6 +471,9 @@ ssize_t legion_intel_msr_pcore_vfpoint_offset_show(struct legion_intel_msr_priva
         if (!data.error) {
             int offset_mv = msr_to_uv((u32)data.result);
             len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
+        } else {
+            // NEW: Print the error code so we aren't flying blind!
+            len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERROR %d\n", i, data.error);
         }
     }
     return len;
@@ -516,7 +518,10 @@ ssize_t legion_intel_msr_ecore_vfpoint_offset_show(struct legion_intel_msr_priva
         if (!data.error) {
             int offset_mv = msr_to_uv((u32)data.result);
             len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
-        }
+        } else {
+                    // NEW: Print the error code so we aren't flying blind!
+                    len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERROR %d\n", i, data.error);
+                }
     }
     return len;
 }
@@ -558,6 +563,9 @@ ssize_t legion_intel_msr_pcore_vfpoint_freq_show(struct legion_intel_msr_private
         
         if (!data.error && data.result > 0) {
             len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %llu\n", i, data.result);
+        } else if (data.error) {
+            // NEW: Print the error code
+            len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERROR %d\n", i, data.error);
         }
     }
     return len;
@@ -577,7 +585,10 @@ ssize_t legion_intel_msr_ecore_vfpoint_freq_show(struct legion_intel_msr_private
         
         if (!data.error && data.result > 0) {
             len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %llu\n", i, data.result);
-        }
+        } else if (data.error) {
+                    // NEW: Print the error code
+                    len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERROR %d\n", i, data.error);
+                }
     }
     return len;
 }
