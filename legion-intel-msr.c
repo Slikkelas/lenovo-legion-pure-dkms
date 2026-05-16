@@ -322,75 +322,27 @@ static void write_vfpoint_offset_on_cpu(void *info)
 {
     struct vfpoint_data *data = info;
     const u32 offset_encoded = uv_to_msr(data->offset_uv);
+    u32 low = 0, high = 0;
 
     // MSR 0x150 format for V/F point offset:
     // [63]    = Busy bit (set to 1 to initiate command)
     // [47:40] = Domain/Plane ID
     // [39:32] = Command (0x14 = write V/F point offset)
     // [31:21] = Voltage offset (11-bit signed, two's complement)
-    // [7:0]   = V/F point index
+    // [15:8]  = V/F point index (Shift restored)
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
                         ((u64)0x14 << 32) |
                         ((u64)(offset_encoded & 0x7FF) << 21) |
-                        ((u64)(data->vf_point & 0xFF)); // Corrected bit alignment
+                        ((u64)(data->vf_point & 0xFF) << 8);
 
-    wrmsr_safe(MSR_VOLTAGE_OFFSET, (const u32)msr_val, (const u32)(msr_val >> 32));
-}
-
-/*
- * Read V/F Point Offset via OC Mailbox
- */
-static void read_vfpoint_offset_on_cpu(void *info)
-{
-    struct vfpoint_data *data = info;
-    u32 low = 0, high = 0;
-
-    // Command 0x13 = read V/F point offset
-    const u64 msr_val = ((u64)1 << 63) |
-                        ((u64)(data->domain & 0xFF) << 40) |
-                        ((u64)0x13 << 32) |
-                        ((u64)(data->vf_point & 0xFF)); // Corrected bit alignment
-
-    int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
+    int err = wrmsr_safe(MSR_VOLTAGE_OFFSET, (const u32)msr_val, (const u32)(msr_val >> 32));
     if (err) {
         data->error = err;
         return;
     }
 
-    udelay(10); // Small delay for mailbox to process
-
-    err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
-    if (err) {
-        data->error = err;
-        return;
-    }
-
-    data->result = ((u64)high << 32) | low;
-    data->error = 0;
-}
-
-/*
- * Read V/F Point Ratio via OC Mailbox
- */
-static void read_vfpoint_ratio_on_cpu(void *info)
-{
-    struct vfpoint_data *data = info;
-    u32 low = 0, high = 0;
-
-    // Command 0x12 = read V/F point ratio
-    const u64 msr_val = ((u64)1 << 63) |
-                        ((u64)(data->domain & 0xFF) << 40) |
-                        ((u64)0x12 << 32) |
-                        ((u64)(data->vf_point & 0xFF)); // Corrected bit alignment
-
-    int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
-    if (err) {
-        data->error = err;
-        return;
-    }
-
-    // Safely poll the busy bit
+    // Polling loop added to catch errors and prevent MSR contention
     int timeout = 100;
     do {
         udelay(10);
@@ -411,11 +363,98 @@ static void read_vfpoint_ratio_on_cpu(void *info)
         return;
     }
 
-    // The actual frequency ratio is returned in bits [7:0] of the lower 32 bits.
-    data->result = low & 0xFF; // Corrected extraction logic
     data->error = 0;
 }
 
+/*
+ * Read V/F Point Offset via OC Mailbox
+ */
+static void read_vfpoint_offset_on_cpu(void *info)
+{
+    struct vfpoint_data *data = info;
+    u32 low = 0, high = 0;
+
+    // Command 0x13 = read V/F point offset
+    const u64 msr_val = ((u64)1 << 63) |
+                        ((u64)(data->domain & 0xFF) << 40) |
+                        ((u64)0x13 << 32) |
+                        ((u64)(data->vf_point & 0xFF) << 8); // Shift restored
+
+    int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
+    if (err) {
+        data->error = err;
+        return;
+    }
+
+    // REQUIRED: Polling loop to wait for data (was missing previously)
+    int timeout = 100;
+    do {
+        udelay(10);
+        err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
+        if (err) {
+            data->error = err;
+            return;
+        }
+    } while ((high & 0x80000000) && --timeout);
+
+    if (timeout == 0) {
+        data->error = -ETIMEDOUT;
+        return;
+    }
+
+    if ((high & 0xFF) != 0) {
+        data->error = -(high & 0xFF);
+        return;
+    }
+
+    data->result = ((u64)high << 32) | low;
+    data->error = 0;
+}
+
+/*
+ * Read V/F Point Ratio via OC Mailbox
+ */
+static void read_vfpoint_ratio_on_cpu(void *info)
+{
+    struct vfpoint_data *data = info;
+    u32 low = 0, high = 0;
+
+    // Command 0x12 = read V/F point ratio
+    const u64 msr_val = ((u64)1 << 63) |
+                        ((u64)(data->domain & 0xFF) << 40) |
+                        ((u64)0x12 << 32) |
+                        ((u64)(data->vf_point & 0xFF) << 8); // Shift restored
+
+    int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
+    if (err) {
+        data->error = err;
+        return;
+    }
+
+    int timeout = 100;
+    do {
+        udelay(10);
+        err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
+        if (err) {
+            data->error = err;
+            return;
+        }
+    } while ((high & 0x80000000) && --timeout);
+
+    if (timeout == 0) {
+        data->error = -ETIMEDOUT;
+        return;
+    }
+
+    if ((high & 0xFF) != 0) {
+        data->error = -(high & 0xFF);
+        return;
+    }
+
+    // The actual frequency ratio is returned in bits [7:0] of the lower 32 bits
+    data->result = low & 0xFF;
+    data->error = 0;
+}
 
 /*
  * P-Core V/F Point Sysfs Show & Store
