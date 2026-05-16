@@ -329,12 +329,12 @@ static void write_vfpoint_offset_on_cpu(void *info)
     // [47:40] = Domain/Plane ID
     // [39:32] = Command (0x14 = write V/F point offset)
     // [31:21] = Voltage offset (11-bit signed, two's complement)
-    // [15:8]  = V/F point index (Shift restored)
+    // [7:0]   = V/F point index
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
                         ((u64)0x14 << 32) |
                         ((u64)(offset_encoded & 0x7FF) << 21) |
-                        ((u64)(data->vf_point & 0xFF) << 8);
+                        ((u64)(data->vf_point & 0xFF)); // Shift removed
 
     int err = wrmsr_safe(MSR_VOLTAGE_OFFSET, (const u32)msr_val, (const u32)(msr_val >> 32));
     if (err) {
@@ -342,7 +342,7 @@ static void write_vfpoint_offset_on_cpu(void *info)
         return;
     }
 
-    // Polling loop added to catch errors and prevent MSR contention
+    // Polling loop to catch errors and prevent MSR contention
     int timeout = 100;
     do {
         udelay(10);
@@ -378,7 +378,7 @@ static void read_vfpoint_offset_on_cpu(void *info)
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
                         ((u64)0x13 << 32) |
-                        ((u64)(data->vf_point & 0xFF) << 8); // Shift restored
+                        ((u64)(data->vf_point & 0xFF)); // Shift removed
 
     int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
     if (err) {
@@ -386,7 +386,7 @@ static void read_vfpoint_offset_on_cpu(void *info)
         return;
     }
 
-    // REQUIRED: Polling loop to wait for data (was missing previously)
+    // REQUIRED: Polling loop to wait for data
     int timeout = 100;
     do {
         udelay(10);
@@ -423,7 +423,7 @@ static void read_vfpoint_ratio_on_cpu(void *info)
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
                         ((u64)0x12 << 32) |
-                        ((u64)(data->vf_point & 0xFF) << 8); // Shift restored
+                        ((u64)(data->vf_point & 0xFF)); // Shift removed
 
     int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
     if (err) {
@@ -451,8 +451,8 @@ static void read_vfpoint_ratio_on_cpu(void *info)
         return;
     }
 
-    // The actual frequency ratio is returned in bits [15:8] of the lower 32 bits
-    data->result = (low >> 8) & 0xFF;
+    // The actual frequency ratio is returned in bits [7:0] of the lower 32 bits
+    data->result = low & 0xFF;
     data->error = 0;
 }
 
