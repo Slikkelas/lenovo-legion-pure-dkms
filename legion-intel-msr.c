@@ -374,11 +374,11 @@ static void read_vfpoint_offset_on_cpu(void *info)
     struct vfpoint_data *data = info;
     u32 low = 0, high = 0;
 
-    // Command 0x13 = read V/F point offset
+    // Command 0x15 = read V/F point offset (Fixed: was 0x13)
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
-                        ((u64)0x13 << 32) |
-                        ((u64)(data->vf_point & 0xFF) << 8); // <-- Added << 8 shift here
+                        ((u64)0x15 << 32) |                       // <-- CHANGED from 0x13 to 0x15
+                        ((u64)(data->vf_point & 0xFF) << 8);
 
     int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
     if (err) {
