@@ -339,14 +339,15 @@ static void write_vfpoint_offset_on_cpu(void *info)
 }
 
 /*
- * Read V/F Point Offset via OC Mailbox
+ * Read V/F Point Ratio via OC Mailbox
  */
-static void read_vfpoint_offset_on_cpu(void *info)
+static void read_vfpoint_ratio_on_cpu(void *info)
 {
     struct vfpoint_data *data = info;
     u32 low = 0, high = 0;
 
-    // Command 0x10 = read voltage offset
+    // Command 0x10 (Read Voltage Offset / V/F Point)
+    // The PCU returns BOTH the offset and the frequency ratio.
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
                         ((u64)0x10 << 32) |
@@ -358,15 +359,32 @@ static void read_vfpoint_offset_on_cpu(void *info)
         return;
     }
 
-    udelay(10); // Small delay for mailbox to process
+    // Wait for the PCU to clear the busy bit (Bit 63 / Bit 31 of high)
+    // Polling is safer for hardware than a static udelay.
+    int timeout = 100;
+    do {
+        udelay(10);
+        err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
+        if (err) {
+            data->error = err;
+            return;
+        }
+    } while ((high & 0x80000000) && --timeout);
 
-    err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
-    if (err) {
-        data->error = err;
+    if (timeout == 0) {
+        data->error = -ETIMEDOUT;
         return;
     }
 
-    data->result = ((u64)high << 32) | low;
+    // CRITICAL FIX: The command status is in bits [39:32], which is the lowest byte of 'high'.
+    // 0 = success, anything else is a PCU rejection.
+    if ((high & 0xFF) != 0) {
+        data->error = -(high & 0xFF);
+        return;
+    }
+
+    // The actual frequency ratio is returned in bits [15:8] of the lower 32 bits.
+    data->result = (low >> 8) & 0xFF; 
     data->error = 0;
 }
 
