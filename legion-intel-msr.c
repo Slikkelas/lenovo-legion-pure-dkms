@@ -593,6 +593,78 @@ ssize_t legion_intel_msr_ecore_vfpoint_freq_show(struct legion_intel_msr_private
     }
     return len;
 }
+
+/*
+ * OC Mailbox Domain Brute-Force Testing
+ */
+static void bruteforce_domains_on_cpu(void *info)
+{
+    int cpu = smp_processor_id();
+    int core_type = get_intel_core_type_on_cpu(cpu);
+    u32 low = 0, high = 0;
+
+    pr_info("legion-intel-msr: Starting Domain Sweep on CPU %d (Type: %s)\n", 
+            cpu, core_type == INTEL_HYBRID_CORE_TYPE_PCORE ? "P-Core" : "E-Core");
+
+    // Sweep Domains 0x00 through 0xFF
+    for (u64 domain = 0x0; domain <= 0xFF; domain++) {
+        
+        // Command 0x11 (Write Offset) with 0mV payload to V/F Point 1
+        u32 offset_encoded = uv_to_msr(0);
+        u64 msr_val = ((u64)1 << 63) |
+                      (domain << 40) |
+                      ((u64)0x11 << 32) |
+                      ((u64)(offset_encoded & 0x7FF) << 21) |
+                      ((u64)1 << 8);
+
+        if (wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32)))
+            continue; // Ignore raw MSR faults
+
+        // Poll for PCU busy bit to clear
+        int timeout = 100;
+        do {
+            udelay(10);
+            if (rdmsr_safe(MSR_OC_MAILBOX, &low, &high)) break;
+        } while ((high & 0x80000000) && --timeout);
+
+        if (timeout == 0) {
+            pr_warn("legion-intel-msr: PCU timeout on Domain 0x%02llX\n", domain);
+            continue;
+        }
+
+        u8 pcu_status = high & 0xFF;
+        
+        if (pcu_status == 0) {
+            pr_info("legion-intel-msr: *** SUCCESS *** CPU %d accepted Domain 0x%02llX for V/F Point 1!\n", cpu, domain);
+        } else if (pcu_status != 2 && pcu_status != 3) {
+            // Log anything that isn't a standard 'Illegal Domain' or 'Illegal Parameter' rejection
+            pr_info("legion-intel-msr: CPU %d Domain 0x%02llX returned PCU Status: %d\n", cpu, domain, pcu_status);
+        }
+    }
+}
+
+ssize_t legion_intel_msr_bruteforce_store(struct legion_intel_msr_private *priv, const char *buf, size_t count)
+{
+    int pcore_target = -1;
+    int ecore_target = -1;
+    int cpu;
+
+    // Find the first available P-Core and E-Core to run the sweep on
+    for_each_online_cpu(cpu) {
+        if (pcore_target == -1 && get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_PCORE)
+            pcore_target = cpu;
+        if (ecore_target == -1 && get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_ECORE)
+            ecore_target = cpu;
+    }
+
+    if (pcore_target != -1)
+        smp_call_function_single(pcore_target, bruteforce_domains_on_cpu, NULL, 1);
+    
+    if (ecore_target != -1)
+        smp_call_function_single(ecore_target, bruteforce_domains_on_cpu, NULL, 1);
+
+    return count;
+}
 // end
 
 /*
