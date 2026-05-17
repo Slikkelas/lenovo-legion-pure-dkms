@@ -75,6 +75,8 @@ ssize_t legion_intel_msr_ecore_vfpoint_offset_store(struct legion_intel_msr_priv
 ssize_t legion_intel_msr_pcore_vfpoint_freq_show(struct legion_intel_msr_private *priv, char *buf);
 ssize_t legion_intel_msr_ecore_vfpoint_freq_show(struct legion_intel_msr_private *priv, char *buf);
 ssize_t legion_intel_msr_bruteforce_store(struct legion_intel_msr_private *priv, const char *buf, size_t count);
+ssize_t legion_intel_msr_bruteforce_read_store(struct legion_intel_msr_private *priv, const char *buf, size_t count);
+
 // end
 
 int  legion_intel_msr_init(struct legion_intel_msr_private *intel_msr_private);

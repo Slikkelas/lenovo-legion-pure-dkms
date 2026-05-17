@@ -665,6 +665,61 @@ ssize_t legion_intel_msr_bruteforce_store(struct legion_intel_msr_private *priv,
 
     return count;
 }
+
+ssize_t legion_intel_msr_bruteforce_read_store(struct legion_intel_msr_private *priv, const char *buf, size_t count)
+{
+    u32 target_domain;
+    u32 low = 0, high = 0;
+    int index;
+
+    // Parse the domain ID from the user (e.g., "16" for 0x10)
+    if (kstrtouint(buf, 0, &target_domain)) 
+        return -EINVAL;
+
+    if (target_domain > 0xFF) 
+        return -EINVAL;
+
+    // We don't need a noisy start message for every domain, just log successes.
+    // Loop through Index 0x00 to 0xFF
+    for (index = 0; index <= 0xFF; index++) {
+        
+        // Command 0x10 (Read), passing Index in bits [15:8]
+        u64 msr_val = ((u64)1 << 63) | 
+                      ((u64)(target_domain & 0xFF) << 40) | 
+                      ((u64)0x10 << 32) | 
+                      ((u64)(index & 0xFF) << 8);
+
+        // We disable preemption ONLY for the specific MSR transaction to keep it atomic
+        preempt_disable();
+        if (wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32))) {
+            preempt_enable();
+            continue;
+        }
+
+        // Poll for PCU busy bit to clear
+        int timeout = 100;
+        do {
+            udelay(10);
+            if (rdmsr_safe(MSR_OC_MAILBOX, &low, &high)) break;
+        } while ((high & 0x80000000) && --timeout);
+        preempt_enable();
+
+        if (timeout == 0) continue;
+
+        u8 pcu_status = high & 0xFF;
+        
+        // If the PCU accepted the Read command and returned data
+        if (pcu_status == 0) {
+            int offset_mv = msr_to_uv(low);
+            u8 ratio = (low >> 8) & 0xFF;
+            
+            pr_info("legion-intel-msr: [Domain 0x%02X] Index 0x%02X -> SUCCESS | Raw Low: 0x%08X (Decoded: %dmV, Ratio: %d)\n", 
+                    target_domain, index, low, offset_mv, ratio);
+        }
+    }
+
+    return count;
+}
 // end
 
 /*

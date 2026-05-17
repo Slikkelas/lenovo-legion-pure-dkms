@@ -445,12 +445,26 @@ static ssize_t ecore_vfpoint_freq_show(struct device *dev, struct device_attribu
     return legion_intel_msr_ecore_vfpoint_freq_show(&priv->intel_msr_private, buf);
 }
 
+/*
+ * V/f point bruteforce readout
+ */
 static ssize_t bruteforce_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
     struct legion_data *priv = dev_get_drvdata(dev);
     if (!priv) return -ENODEV;
     
     return legion_intel_msr_bruteforce_store(&priv->intel_msr_private, buf, count);
+}
+
+/*
+ * Chip bit read sweep
+ */
+static ssize_t bruteforce_read_domain_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct legion_data *priv = dev_get_drvdata(dev);
+    if (!priv) return -ENODEV;
+    
+    return legion_intel_msr_bruteforce_read_store(&priv->intel_msr_private, buf, count);
 }
 
 // end
@@ -695,6 +709,7 @@ static DEVICE_ATTR_RW(ecore_vfpoint_offset);
 static DEVICE_ATTR_RO(pcore_vfpoint_freq);
 static DEVICE_ATTR_RO(ecore_vfpoint_freq);
 static DEVICE_ATTR_WO(bruteforce);
+static DEVICE_ATTR_WO(bruteforce_read_domain);
 // end
 
 
@@ -714,7 +729,7 @@ static struct attribute *legion_intel_msr_sysfs_attributes[]  = {
         &dev_attr_pcore_vfpoint_freq.attr,
         &dev_attr_ecore_vfpoint_freq.attr,
         &dev_attr_bruteforce.attr,
-        
+        &dev_attr_bruteforce_read_domain.attr,
 		// end
 
 	    &dev_attr_cpu_max_undervolt.attr,
