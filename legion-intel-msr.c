@@ -322,20 +322,44 @@ static void write_vfpoint_offset_on_cpu(void *info)
 {
     struct vfpoint_data *data = info;
     const u32 offset_encoded = uv_to_msr(data->offset_uv);
+    u32 low = 0, high = 0;
 
-    // MSR 0x150 format for V/F point offset:
-    // [63]    = Busy bit (set to 1 to initiate command)
-    // [47:40] = Domain/Plane ID
-    // [39:32] = Command (0x11 = write voltage offset)
-    // [31:21] = Voltage offset (11-bit signed, two's complement)
-    // [20:0]  = V/F point index (Injected into bits [15:8])
+    // Command 0x11 = write voltage offset
     const u64 msr_val = ((u64)1 << 63) |
                         ((u64)(data->domain & 0xFF) << 40) |
                         ((u64)0x11 << 32) |
                         ((u64)(offset_encoded & 0x7FF) << 21) |
                         ((u64)(data->vf_point & 0xFF) << 8);
 
-    wrmsr_safe(MSR_VOLTAGE_OFFSET, (const u32)msr_val, (const u32)(msr_val >> 32));
+    int err = wrmsr_safe(MSR_VOLTAGE_OFFSET, (u32)msr_val, (u32)(msr_val >> 32));
+    if (err) {
+        data->error = err;
+        return;
+    }
+
+    // Poll for the PCU to clear the busy bit
+    int timeout = 100;
+    do {
+        udelay(10);
+        err = rdmsr_safe(MSR_VOLTAGE_OFFSET, &low, &high);
+        if (err) {
+            data->error = err;
+            return;
+        }
+    } while ((high & 0x80000000) && --timeout);
+
+    if (timeout == 0) {
+        data->error = -ETIMEDOUT;
+        return;
+    }
+
+    // Check PCU command status in bits [39:32]
+    if ((high & 0xFF) != 0) {
+        data->error = -(high & 0xFF);
+        return;
+    }
+
+    data->error = 0;
 }
 
 /*
@@ -384,9 +408,12 @@ ssize_t legion_intel_msr_pcore_vfpoint_offset_show(struct legion_intel_msr_priva
         smp_call_function_single(0, read_vfpoint_offset_on_cpu, &data, 1);
         
         if (!data.error) {
-            int offset_mv = msr_to_uv((u32)data.result);
-            len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
-        }
+                    int offset_mv = msr_to_uv((u32)data.result);
+                    len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
+                } else {
+                    // Surface the error directly to the sysfs output
+                    len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERR %d\n", i, data.error);
+                }
     }
     return len;
 }
@@ -409,9 +436,14 @@ ssize_t legion_intel_msr_pcore_vfpoint_offset_store(struct legion_intel_msr_priv
     };
     
     guard(mutex)(&priv->lock);
-    on_each_cpu(write_vfpoint_offset_on_cpu, &data, 1);
-
-    return count;
+        on_each_cpu(write_vfpoint_offset_on_cpu, &data, 1);
+    
+        if (data.error) {
+            pr_err("legion-intel-msr: PCU rejected P-Core V/F point %d write. Error code: %d\n", vf_point, data.error);
+            return -EIO;
+        }
+    
+        return count;
 }
 
 /*
@@ -428,9 +460,12 @@ ssize_t legion_intel_msr_ecore_vfpoint_offset_show(struct legion_intel_msr_priva
         smp_call_function_single(0, read_vfpoint_offset_on_cpu, &data, 1);
         
         if (!data.error) {
-            int offset_mv = msr_to_uv((u32)data.result);
-            len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
-        }
+                    int offset_mv = msr_to_uv((u32)data.result);
+                    len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
+                } else {
+                    // Surface the error directly to the sysfs output
+                    len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERR %d\n", i, data.error);
+                }
     }
     return len;
 }
@@ -453,9 +488,14 @@ ssize_t legion_intel_msr_ecore_vfpoint_offset_store(struct legion_intel_msr_priv
     };
     
     guard(mutex)(&priv->lock);
-    on_each_cpu(write_vfpoint_offset_on_cpu, &data, 1);
-
-    return count;
+        on_each_cpu(write_vfpoint_offset_on_cpu, &data, 1);
+    
+        if (data.error) {
+            pr_err("legion-intel-msr: PCU rejected P-Core V/F point %d write. Error code: %d\n", vf_point, data.error);
+            return -EIO;
+        }
+    
+        return count;
 }
 
 /*
@@ -520,9 +560,13 @@ ssize_t legion_intel_msr_pcore_vfpoint_freq_show(struct legion_intel_msr_private
         struct vfpoint_data data = { .domain = OC_DOMAIN_PCORE, .vf_point = i, .error = -1 };
         smp_call_function_single(0, read_vfpoint_ratio_on_cpu, &data, 1);
         
-        if (!data.error && data.result > 0) {
-            len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %llu\n", i, data.result);
-        }
+        if (!data.error) {
+                    int offset_mv = msr_to_uv((u32)data.result);
+                    len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
+                } else {
+                    // Surface the error directly to the sysfs output
+                    len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERR %d\n", i, data.error);
+                }
     }
     return len;
 }
@@ -539,9 +583,13 @@ ssize_t legion_intel_msr_ecore_vfpoint_freq_show(struct legion_intel_msr_private
         struct vfpoint_data data = { .domain = OC_DOMAIN_ECORE, .vf_point = i, .error = -1 };
         smp_call_function_single(0, read_vfpoint_ratio_on_cpu, &data, 1);
         
-        if (!data.error && data.result > 0) {
-            len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %llu\n", i, data.result);
-        }
+        if (!data.error) {
+                    int offset_mv = msr_to_uv((u32)data.result);
+                    len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
+                } else {
+                    // Surface the error directly to the sysfs output
+                    len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERR %d\n", i, data.error);
+                }
     }
     return len;
 }
