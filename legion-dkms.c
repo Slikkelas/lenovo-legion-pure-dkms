@@ -1,501 +1,137 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * Copyright Jaroslav Bolek 2025
- *
- * Author(s):
- *   Jaroslav Bolek <jaroslav.bolek@gmail.com>
- */
-#include "legion-dkms.h"
 #include "legion-common.h"
-#include "legion-compatibility.h"
-#include "legion-wmi-gamezone.h"
-#include "legion-wmi-capdata00.h"
-#include "legion-wmi-capdata01.h"
-#include "legion-wmi-other.h"
-#include "legion-wmi-ddata.h"
-#include "legion-firmware-attributes-class.h"
-#include "legion-hwmon.h"
-#include "legion-wmi-ftable.h"
-#include "legion-wmi-fm.h"
 #include "legion-rapl-mmio.h"
 #include "legion-intel-msr-sysfs.h"
-#include "legion-rapl.h"
 
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/device.h>
-#include <linux/acpi.h>
-#include <linux/dmi.h>
-#include <linux/component.h>
+#include <linux/version.h>
+#include <asm/msr.h>
 
+static bool lock_mmio = false;
+module_param(lock_mmio, bool, 0644);
+MODULE_PARM_DESC(lock_mmio, "Lock MMIO power limits to CPU MSR 0x610 values on boot and resume (default: N)");
 
-static BLOCKING_NOTIFIER_HEAD(legion_dkms_head);
-
-
-static int lenovo_dkms_register_notifier(struct notifier_block *nb)
+int legion_sync_msr_to_mmio(struct legion_rapl_mmio_private *mmio_priv, bool lock)
 {
-	return blocking_notifier_chain_register(&legion_dkms_head, nb);
-}
+	u32 msr_low = 0, msr_high = 0;
+	u64 msr_val = 0;
+	unsigned int pl1_mw, pl2_mw;
+	unsigned int pl1_time_enc, pl2_time_enc, f1, y1, f2, y2;
+	unsigned int pl1_time_us, pl2_time_us;
 
-static int lenovo_dkms_unregister_notifier(struct notifier_block *nb)
-{
-	return blocking_notifier_chain_unregister(&legion_dkms_head, nb);
-}
+	if (!mmio_priv || !mmio_priv->rapl_mmio_base)
+		return -ENODEV;
 
-static void devm_lenovo_dkms_unregister_notifier(void *data)
-{
-	struct notifier_block *nb = data;
+	/* Read MSR 0x610 (MSR_PKG_POWER_LIMIT) directly from CPU 0 */
+	if (rdmsr_safe_on_cpu(0, 0x610, &msr_low, &msr_high) != 0)
+		return -EIO;
 
-	lenovo_dkms_unregister_notifier(nb);
-}
+	msr_val = ((u64)msr_high << 32) | msr_low;
 
-int devm_lenovo_dkms_register_notifier(struct device *dev,struct notifier_block *nb)
-{
-	int ret;
+	/* Extract Power Limits (Bits 0-14 and Bits 32-46) in mW */
+	pl1_mw = ((msr_val & 0x7FFF) * 1000) / 8;
+	pl2_mw = (((msr_val >> 32) & 0x7FFF) * 1000) / 8;
 
-	ret = lenovo_dkms_register_notifier(nb);
-	if (ret < 0)
-		return ret;
-
-	return devm_add_action_or_reset(dev, devm_lenovo_dkms_unregister_notifier,nb);
-}
-
-
-static int legion_dkms_notifier_call(void *data,enum other_events_type other_event)
-{
-	int ret;
-
-	ret = blocking_notifier_call_chain(&legion_dkms_head,other_event, data);
-	if ((ret & ~NOTIFY_STOP_MASK) != NOTIFY_OK)
+	if (pl1_mw == 0 || pl2_mw == 0)
 		return -EINVAL;
 
-	return 0;
-}
+	/* Extract and decode Time Windows (Bits 17-23 and Bits 49-55) in us */
+	pl1_time_enc = (msr_val >> 17) & 0x7F;
+	pl2_time_enc = (msr_val >> 49) & 0x7F;
 
-// Modified by Slikkelas
-/*
- * Queries the Lenovo Embedded Controller for the factory default limits
- * (typically Balanced mode) and applies them to the MMIO/RAPL registers.
- */
-static void legion_apply_boot_rapl_limits(struct legion_data *priv, bool use_rapl)
-{
-	/*
-	 * DEFAULT_THERMAL_MODE is defined as Balanced (0x02).
-	 * If you want a different default boot state, you can change this
-	 * to LEGION_WMI_GZ_THERMAL_MODE_QUIET or PERFORMANCE.
-	 */
-	struct other_events_data event_data = {
-		DEFAULT_THERMAL_MODE,
-		&priv->rapl_mmio_private,
-		&priv->rapl_private
-	};
+	f1 = (pl1_time_enc & 0x60) >> 5;
+	y1 = pl1_time_enc & 0x1F;
+	pl1_time_us = (unsigned int)((((1ULL << y1) * (4 + f1) * 1000000ULL / 4) >> 10));
 
-	if (use_rapl) {
-		legion_dkms_notifier_call(&event_data, LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO);
-	} else {
-		legion_dkms_notifier_call(&event_data, LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_MMIO_ONLY);
+	f2 = (pl2_time_enc & 0x60) >> 5;
+	y2 = pl2_time_enc & 0x1F;
+	pl2_time_us = (unsigned int)((((1ULL << y2) * (4 + f2) * 1000000ULL / 4) >> 10));
+
+	if (lock) {
+		return legion_set_power_and_time_lock(mmio_priv,
+						      pl1_mw, pl1_time_us,
+						      pl2_mw, pl2_time_us);
 	}
+
+	return legion_set_power_and_time(mmio_priv, pl1_mw, pl1_time_us, pl2_mw);
 }
-// end
 
 static int legion_pm_resume(struct device *dev)
 {
-	dev_dbg(dev, "PM  Resuming Lenovo Legion platform driver\n");
+	struct legion_data *data = dev_get_drvdata(dev);
 
-    return 0;
+	if (data && data->rapl_mmio_private.rapl_mmio_base) {
+		if (legion_sync_msr_to_mmio(&data->rapl_mmio_private, lock_mmio) == 0)
+			dev_info(dev, "Resumed: synced MSR 0x610 power limits to MMIO (locked=%d)\n", lock_mmio);
+	}
+
+	return 0;
 }
 
-static SIMPLE_DEV_PM_OPS(legion_pm, NULL, legion_pm_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(legion_pm, NULL, legion_pm_resume);
 
 static int legion_probe(struct platform_device *pdev)
 {
-    int err = 0;
-    struct legion_data* data = NULL;
+	int err = 0;
+	struct legion_data *data;
 
-    dev_info(&pdev->dev, "Legion platform driver probing:\n");
+	data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
 
-    err = legion_firmware_attributes_class_init();
-    if(err)
-    {
-    	dev_err(&pdev->dev, "\tFailed to create firmware attributes: %d\n",err);
-        return err;
-    }
-    dev_info(&pdev->dev,"\tLegion firmware attributes was initialized \n");
+	mutex_init(&data->mutex);
+	platform_set_drvdata(pdev, data);
 
-    data  = devm_kzalloc(&pdev->dev, sizeof(struct legion_data), GFP_KERNEL);
-    if (!data) {
-    	dev_err(&pdev->dev, "\tFailed to allocate memory for legion_data\n");
-    	err = -ENOMEM;
-    	goto err_enomem;
-    }
-
-    err = legion_data_init(data);
-    if (err) {
-		dev_err(&pdev->dev, "\tFailed to create legion data structure: %d\n", err);
-		goto err_legion_init;
-	}
-	dev_info(&pdev->dev,"\tLegion data structure was initialized \n");
-
-    platform_set_drvdata(pdev, data);
-
-    read_dmi_machine_information(&data->machine_info.dmi_info);
-    if(!is_compatible(&data->machine_info.dmi_info))
-    {
-    	dev_info(&pdev->dev, "\tIncompatible model !\n");
-    	goto err_model_mismatach;
-    }
-
-    print_machine_information(&pdev->dev,&data->machine_info);
-
-// Deleted by Slikkelas
-    /*
-     * Sysfs Machine information
-     */
-//**    err = machine_information_sysfs_init(data);
-//**	if (err) {
-//**		dev_err(&pdev->dev, "\tFailed to create Sysfs Machine information: %d\n", err);
-//**		goto err_machine_information_sysfs;
-//**	}
-//**	dev_info(&pdev->dev,"\tSysfs Machine information was initialized \n");
-// end
-
-    /*
-     * WMI gamezone
-     */
-    err = legion_wmi_gamezone_driver_init(&pdev->dev);
+	/* Initialize RAPL MMIO and sync with CPU MSR 0x610 (unlocked by default) */
+	err = legion_rapl_mmio_init(&pdev->dev);
 	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create WMI game zone driver: %d\n", err);
-		goto err_wmi_gamezone;
-	}
-	dev_info(&pdev->dev,"\tWMI game zone driver was initialized \n");
-
-// Deleted by Slikkelas
-    /*
-     * WMI events
-     */
-//**    err = legion_wmi_events_driver_init(&pdev->dev);
-//**	if (err) {
-//**		dev_err(&pdev->dev, "\tFailed to create WMI events driver: %d\n", err);
-//**		goto err_wmi_events;
-//**	}
-//**	dev_info(&pdev->dev,"\tWMI events driver was initialized \n");
-
-
-    /*
-     * WMI cd00
-     */
-    err = legion_wmi_cd00_driver_init(&pdev->dev);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create WMI capability data 00 driver: %d\n", err);
-		goto err_wmi_cd00;
-	}
-	dev_info(&pdev->dev,"\tWMI capability data 00 driver was initialized \n");
-
-    /*
-     * WMI cd01
-     */
-    err = legion_wmi_cd01_driver_init(&pdev->dev);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create WMI capability data 01 driver: %d\n", err);
-		goto err_wmi_cd01;
-	}
-	dev_info(&pdev->dev,"\tWMI capability data 01 driver was initialized \n");
-
-    /*
-     * WMI ddata
-     */
-    err = legion_wmi_dd_driver_init(&pdev->dev);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create WMI discrete data driver: %d\n", err);
-		goto err_wmi_dd;
-	}
-	dev_info(&pdev->dev,"\tWMI discrete data driver was initialized \n");
-
-    /*
-     * WMI other
-     */
-    err = legion_wmi_other_driver_init(&pdev->dev);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create WMI other driver: %d\n", err);
-		goto err_wmi_other;
-	}
-	dev_info(&pdev->dev,"\tWMI other driver was initialized \n");
-
-	/*
-     * Fan Table
-     */
-    err = legion_wmi_ftable_driver_init(&pdev->dev);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create WMI Fan table driver: %d\n", err);
-		goto err_ftable;
-	}
-	dev_info(&pdev->dev,"\tWMI Fan table driver was initialized \n");
-
-	/*
-     * Fan Method
-     */
-    err = legion_wmi_fm_driver_init(&pdev->dev);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create WMI Fan method driver: %d\n", err);
-		goto err_fm;
-	}
-	dev_info(&pdev->dev,"\tWMI Fan method driver was initialized \n");
-
-    /*
-     * HwMon
-     */
-    err = legion_hwmon_init(&pdev->dev);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create HwMon driver: %d\n", err);
-		goto err_hwmon;
-	}
-	dev_info(&pdev->dev,"\tHwMon driver was initialized \n");
-
-
-	/*
-	 * RAPL
-	 */
-    err = legion_rapl_sysfs_init(&pdev->dev);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create RAPL driver: %d\n", err);
-		goto err_rapl;
-	}
-	dev_info(&pdev->dev,"\tRAPL driver was initialized \n");
-
-    /*
-     * RAPL MMIO
-     */
-    err = legion_rapl_mmio_init(&pdev->dev);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create RAPL MMIO driver: %d\n", err);
-		goto err_rapl_mmio;
-	}
-	dev_info(&pdev->dev,"\tRAPL MMIO driver was initialized \n");
-
-    /*
-     * Intel MSF SysFS
-     */
-    err = legion_intel_msr_sysfs_init(&pdev->dev);
-	if (err) {
-		dev_err(&pdev->dev, "\tFailed to create Intel MSR driver: %d\n", err);
-		goto err_intel_msr;
-	}
-	dev_info(&pdev->dev,"\tIntel MSR driver was initialized \n");
-
-
-	/*
-	 * Post initialization
-	 */
-	bool is_rapl_enabled = false;
-	err = legion_rapl_sysfs_is_enabled(&data->rapl_private,&is_rapl_enabled);
-	if (err) {
-		dev_warn(&pdev->dev, "\tIntel RAPL post initialization error, probably Intel RAPL is not loaded : %d\n", err);
-	}
-
-	bool is_rapl_mmio_locked = false;
-	err = legion_is_locked_power_read(&data->rapl_mmio_private,&is_rapl_mmio_locked);
-	if (err) {
-		dev_err(&pdev->dev, "\tIntel RAPL MMIO post initialization error ! : %d\n", err);
-		goto post_init_err;
-	}
-
-	// Modified by Slikkelas
-	/*
-	 * Lock the RAPL MMIO = > using RAPL
-	 */
-	//** if(is_rapl_enabled)
-	//** {
-	//** 	if(!is_rapl_mmio_locked)
-	//** 	{
-	//**		dev_info(&pdev->dev,"\tRAPL and RAPL MMIO synchronization \n");
-	//**
-	//**		data->nb.notifier_call = legion_wmi_gz_event_call_for_rapl;
-
-	//**        struct other_events_data  event_data = {
-	//**		DEFAULT_THERMAL_MODE,
-	//**				&data->rapl_mmio_private,
-	//**				&data->rapl_private
-	//**		};
-
-			//**  legion_dkms_notifier_call(&event_data,LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_AND_MMIO);
-		//** }
-	//** } else
-	//** {
-	//**	dev_info(&pdev->dev,"\tRAPL MMIO synchronization only \n");
-
-	//**	data->nb.notifier_call = legion_wmi_gz_event_call_for_rapl_mmio;
-
-	//**	struct other_events_data  event_data = {
-	//**			DEFAULT_THERMAL_MODE,
-	//**			&data->rapl_mmio_private,
-	//**			&data->rapl_private
-	//**	};
-
-		//** legion_dkms_notifier_call(&event_data,LEGION_WMI_OTHER_SET_THERMAL_MODE_RAPL_MMIO_ONLY);
-	//** }
-
-	//** err = devm_legion_wmi_events_register_notifier(&pdev->dev, &data->nb);
-	//** if (err){
-	//**	dev_err(&pdev->dev, "\tLegion platform post initialization error ! : %d\n", err);
-	//**	goto post_init_err;
-	//** }
-
-	// Added by Slikkelas
-	/*
-	 * Fetch and apply the default factory power limits from the EC.
-	 * This establishes a safe baseline before userspace takes over.
-	 */
-	if (is_rapl_enabled && !is_rapl_mmio_locked) {
-		dev_info(&pdev->dev, "\tApplying factory default limits (RAPL + MMIO sync)\n");
-		legion_apply_boot_rapl_limits(data, true);
-	} else if (!is_rapl_enabled) {
-		dev_info(&pdev->dev, "\tApplying factory default limits (MMIO only)\n");
-		legion_apply_boot_rapl_limits(data, false);
+		dev_warn(&pdev->dev, "RAPL MMIO device not found (%d), continuing with MSR only\n", err);
 	} else {
-		dev_info(&pdev->dev, "\tRAPL MMIO is locked by BIOS. Cannot apply limits.\n");
+		if (legion_sync_msr_to_mmio(&data->rapl_mmio_private, lock_mmio) == 0)
+			dev_info(&pdev->dev, "Synced CPU MSR 0x610 limits to RAPL MMIO (locked=%d)\n", lock_mmio);
 	}
 
-	dev_info(&pdev->dev,"Legion platform driver was loaded\n");
+	/* Initialize Intel MSR SysFS (/sys/class/legion-intel-msr/intel-msr-0) */
+	err = legion_intel_msr_sysfs_init(&pdev->dev);
+	if (err) {
+		dev_err(&pdev->dev, "Failed to initialize Intel MSR sysfs: %d\n", err);
+		legion_rapl_mmio_exit(&pdev->dev);
+		mutex_destroy(&data->mutex);
+		return err;
+	}
+
+	dev_info(&pdev->dev, "Universal Intel MSR & RAPL MMIO driver loaded\n");
 	return 0;
-post_init_err:
-err_intel_msr:
-	legion_rapl_mmio_exit(&pdev->dev);
-err_rapl_mmio:
-	legion_rapl_sysfs_exit(&pdev->dev);
-err_rapl:
-	legion_hwmon_exit(&pdev->dev);
-err_hwmon:
-	legion_wmi_fm_driver_exit();
-err_fm:
-	legion_wmi_ftable_driver_exit();
-err_ftable:
-	legion_wmi_other_driver_exit();
-err_wmi_other:
-	legion_wmi_dd_driver_exit();
-err_wmi_dd:
-	legion_wmi_cd01_driver_exit();
-err_wmi_cd01:
-	legion_wmi_cd00_driver_exit();
-	// Deleted by Slikkelas
-//** err_wmi_cd00:
-//**	legion_wmi_events_driver_exit();
-//** err_wmi_events:
-//**	legion_wmi_gamezone_driver_exit();
-	// end
-// Added by Slikkelas
-err_wmi_cd00:
-	legion_wmi_gamezone_driver_exit();
-	// end
-err_wmi_gamezone:
-// Deleted by Slikkelas
-//**	machine_information_sysfs_exit(data);
-//** err_machine_information_sysfs:
-// end
-err_model_mismatach:
-	legion_data_exit(data);
-err_legion_init:
-err_enomem:
-	legion_firmware_attributes_class_exit();
-	dev_err(&pdev->dev, "Legion platform not loaded for this device\n");
-	return err;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 static void legion_remove(struct platform_device *pdev)
+#else
+static int legion_remove(struct platform_device *pdev)
+#endif
 {
-	struct legion_data* data = platform_get_drvdata(pdev);
+	struct legion_data *data = platform_get_drvdata(pdev);
 
-    dev_info(&pdev->dev, "Lenovo Legion platform driver removing:\n");
+	legion_intel_msr_sysfs_exit(&pdev->dev);
+	legion_rapl_mmio_exit(&pdev->dev);
 
-    legion_intel_msr_sysfs_exit(&pdev->dev);
-    dev_info(&pdev->dev, "\tIntel MSR driver was unregistered \n");
+	if (data)
+		mutex_destroy(&data->mutex);
 
-    legion_rapl_mmio_exit(&pdev->dev);
-    dev_info(&pdev->dev, "\tRAPL MMIO driver was unregistered \n");
-
-	legion_rapl_sysfs_exit(&pdev->dev);
-    dev_info(&pdev->dev, "\tRAPL driver was unregistered \n");
-
-    legion_hwmon_exit(&pdev->dev);
-    dev_info(&pdev->dev, "\tHwMon driver was unregistered \n");
-
-    legion_wmi_fm_driver_exit();
-    dev_info(&pdev->dev, "\tWMI Fan method was unregistered \n");
-
-    legion_wmi_ftable_driver_exit();
-    dev_info(&pdev->dev, "\tWMI Fan table was unregistered \n");
-
-    legion_wmi_other_driver_exit();
-    dev_info(&pdev->dev, "\tWMI other driver was unregistered \n");
-
-	legion_wmi_dd_driver_exit();
-    dev_info(&pdev->dev, "\tWMI discrete data was unregistered \n");
-
-    legion_wmi_cd01_driver_exit();
-    dev_info(&pdev->dev, "\tWMI capability data 01 driver was unregistered \n");
-
-    legion_wmi_cd00_driver_exit();
-    dev_info(&pdev->dev, "\tWMI capability data 00 driver was unregistered \n");
-
-    legion_wmi_gamezone_driver_exit();
-    dev_info(&pdev->dev, "\tWMI game zone driver was unregistered \n");
-// Deleted by Slikkelas
-    //** legion_wmi_events_driver_exit();
-    //** dev_info(&pdev->dev, "\tWMI events driver was unregistered \n");
-
-    //** machine_information_sysfs_exit(data);
-    //** dev_info(&pdev->dev, "\tSysfs Machine information was unregistered \n");
-// end
-    legion_data_exit(data);
-    dev_info(&pdev->dev, "\tLegion data structure was unregistered \n");
-
-    legion_firmware_attributes_class_exit();
-    dev_info(&pdev->dev, "\tLegion firmware attributes was unregistered \n");
-
-    dev_info(&pdev->dev, "Legion platform driver was removed\n");
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+	return 0;
+#endif
 }
-
-static int legion_resume(struct platform_device *pdev)
-{
-	dev_dbg(&pdev->dev, "Resuming Lenovo Legion platform driver\n");
-    return 0;
-}
-
-static void legion_shutdown(struct platform_device *pdev)
-{
-	dev_dbg(&pdev->dev, "Shutting down Lenovo Legion platform driver\n");
-}
-
-static int legion_suspend(struct platform_device *pdev, pm_message_t state)
-{
-	dev_dbg(&pdev->dev, "Suspending Lenovo Legion platform driver\n");
-    return 0;
-}
-
-// Deleted by Slikkelas
-/*
- * VPC2004 Virtual power connector
- */
-//** static const struct acpi_device_id legion_device_ids[] =
-//** {
-//**    { "VPC2004", 0 },
-//**    { "", 0 },
-//** };
-// end
 
 static struct platform_driver legion_driver = {
-	.probe      = legion_probe,
-	.remove     = legion_remove,
-	.shutdown   = legion_shutdown,
-	.suspend    = legion_suspend,
-	.resume     = legion_resume,
+	.probe  = legion_probe,
+	.remove = legion_remove,
 	.driver = {
-		.name   = "lenovo-legion",
-		.pm     = &legion_pm,
-		// Deleted by Slikkelas to severe ACPI conflict with ideapad_laptop
-		//** .acpi_match_table = ACPI_PTR(legion_device_ids),
-		// end
-		.owner  = THIS_MODULE
-	}
+		.name = "lenovo-legion",
+		.pm   = pm_sleep_ptr(&legion_pm),
+	},
 };
 
 static struct platform_device *legion_pdev;
@@ -535,7 +171,5 @@ module_exit(legion_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jaroslav Bolek (Modified by Slikkelas)");
-MODULE_DESCRIPTION("Originally: Lenovo Legion Pro 7 16IRX9H DKMS driver. Now: Lenovo Legion Core MSR/RAPL Injector");
-MODULE_VERSION("0.9.10");
-// Deleted by Slikkelas
-//** MODULE_DEVICE_TABLE(acpi, legion_device_ids);
+MODULE_DESCRIPTION("Universal Intel MSR Undervolt, Ratio & RAPL MMIO Sync Driver");
+MODULE_VERSION("2.0.0");

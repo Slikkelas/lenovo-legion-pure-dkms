@@ -1,0 +1,12 @@
+[Unit]
+Description=Universal Intel MSR, Ratio & RAPL MMIO Tuning
+# Make sure sysfs is fully mounted, modules are loaded, and resume has completed
+After=sysfs.mount systemd-modules-load.service multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/legion-tune-settings.sh
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

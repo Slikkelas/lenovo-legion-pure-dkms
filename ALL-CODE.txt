@@ -1,0 +1,2425 @@
+PACKAGE_NAME="LenovoLegion"
+PACKAGE_VERSION="2.0.0"
+MAKE[0]="make KERNEL_VERSION=${kernelver}"
+BUILT_MODULE_NAME[0]="lenovo_legion"
+AUTOINSTALL="yes"
+DEST_MODULE_LOCATION[0]="/kernel/drivers/platform/x86"
+#!/bin/bash
+# Universal Intel MSR & RAPL MMIO DKMS Installer
+
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run this installer as root (sudo ./install.sh)"
+  exit 1
+fi
+
+MOD_NAME=$(awk -F'=' '/^PACKAGE_NAME/ {gsub(/"/, "", $2); print $2}' dkms.conf)
+MOD_VERS=$(awk -F'=' '/^PACKAGE_VERSION/ {gsub(/"/, "", $2); print $2}' dkms.conf)
+
+echo "Installing $MOD_NAME version $MOD_VERS to DKMS..."
+
+# 1. Remove any stale DKMS registration
+dkms remove -m "${MOD_NAME}" -v "${MOD_VERS}" --all 2>/dev/null || true
+rm -rf "/usr/src/${MOD_NAME}-${MOD_VERS}"
+
+# 2. Copy clean source to /usr/src
+mkdir -p "/usr/src/${MOD_NAME}-${MOD_VERS}"
+cp -R . "/usr/src/${MOD_NAME}-${MOD_VERS}/"
+
+# 3. Register, build, and install via DKMS
+dkms add -m "${MOD_NAME}" -v "${MOD_VERS}"
+dkms build -m "${MOD_NAME}" -v "${MOD_VERS}"
+dkms install -m "${MOD_NAME}" -v "${MOD_VERS}"
+
+# 4. Set up auto-load on boot and lock MMIO to MSR values by default
+echo "Setting up module auto-load and modprobe options..."
+install -m 644 lenovo-legion.conf /etc/modules-load.d/lenovo-legion.conf
+echo "options lenovo_legion lock_mmio=1" > /etc/modprobe.d/lenovo-legion-lock_mmio.conf
+
+# 5. Reload module immediately
+modprobe -r lenovo_legion 2>/dev/null || true
+modprobe lenovo_legion
+
+echo "===================================================="
+echo "SUCCESS! Universal MSR & RAPL MMIO driver is loaded."
+echo "===================================================="
+// SPDX-License-Identifier: GPL-2.0
+#ifndef LEGION_COMMON_H
+#define LEGION_COMMON_H
+
+#include "legion-intel-msr-sysfs.h"
+#include "legion-intel-msr.h"
+#include "legion-rapl-mmio.h"
+
+#include <linux/device.h>
+#include <linux/mutex.h>
+
+struct legion_data {
+	struct mutex mutex;
+	struct legion_rapl_mmio_private rapl_mmio_private;
+	struct legion_intel_msr_sysfs_private intel_msr_sysfs_private;
+	struct legion_intel_msr_private intel_msr_private;
+};
+
+enum legion_events_type {
+	LENOVO_INTEL_MSR_PLANE_CPU      = 2001,
+	LENOVO_INTEL_MSR_PLANE_CACHE    = 2002,
+	LENOVO_INTEL_MSR_PLANE_GPU      = 2003,
+	LENOVO_INTEL_MSR_PLANE_UNCORE   = 2004,
+	LENOVO_INTEL_MSR_PLANE_ANALOGIO = 2005
+};
+
+int legion_sync_msr_to_mmio(struct legion_rapl_mmio_private *mmio_priv, bool lock);
+
+#endif // LEGION_COMMON_H
+// SPDX-License-Identifier: GPL-2.0
+#include "legion-common.h"
+#include "legion-rapl-mmio.h"
+#include "legion-intel-msr-sysfs.h"
+
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/device.h>
+#include <linux/version.h>
+#include <asm/msr.h>
+
+static bool lock_mmio = true;
+module_param(lock_mmio, bool, 0644);
+MODULE_PARM_DESC(lock_mmio, "Lock MMIO power limits on boot and resume (default: Y)");
+
+static unsigned int pl1_mw = 145000;
+module_param(pl1_mw, uint, 0644);
+MODULE_PARM_DESC(pl1_mw, "Custom PL1 limit in mW when locking MMIO (0 = sync from MSR 0x610)");
+
+static unsigned int pl2_mw = 210000;
+module_param(pl2_mw, uint, 0644);
+MODULE_PARM_DESC(pl2_mw, "Custom PL2 limit in mW when locking MMIO (0 = sync from MSR 0x610)");
+
+static void legion_apply_mmio_limits(struct device *dev, struct legion_data *data)
+{
+	u32 msr_low = 0, msr_high = 0;
+	u64 msr_val = 0;
+	unsigned int target_pl1_mw = pl1_mw;
+	unsigned int target_pl2_mw = pl2_mw;
+	unsigned int pl1_time_us = 28000000; /* 28s fallback */
+	unsigned int pl2_time_us = 2440;     /* 2.44ms fallback */
+
+	if (!data->rapl_mmio_private.rapl_mmio_base)
+		return;
+
+	/* Read MSR 0x610 (MSR_PKG_POWER_LIMIT) for time windows and default power limits */
+	if (rdmsr_safe_on_cpu(0, 0x610, &msr_low, &msr_high) == 0) {
+		unsigned int pl1_time_enc, pl2_time_enc, f1, y1, f2, y2;
+
+		msr_val = ((u64)msr_high << 32) | msr_low;
+
+		if (target_pl1_mw == 0)
+			target_pl1_mw = ((msr_val & 0x7FFF) * 1000) / 8;
+		if (target_pl2_mw == 0)
+			target_pl2_mw = (((msr_val >> 32) & 0x7FFF) * 1000) / 8;
+
+		pl1_time_enc = (msr_val >> 17) & 0x7F;
+		pl2_time_enc = (msr_val >> 49) & 0x7F;
+
+		f1 = (pl1_time_enc & 0x60) >> 5;
+		y1 = pl1_time_enc & 0x1F;
+		pl1_time_us = (unsigned int)((((1ULL << y1) * (4 + f1) * 1000000ULL / 4) >> 10));
+
+		f2 = (pl2_time_enc & 0x60) >> 5;
+		y2 = pl2_time_enc & 0x1F;
+		pl2_time_us = (unsigned int)((((1ULL << y2) * (4 + f2) * 1000000ULL / 4) >> 10));
+	}
+
+	if (target_pl1_mw == 0 || target_pl2_mw == 0)
+		return;
+
+	if (lock_mmio) {
+		if (legion_set_power_and_time_lock(&data->rapl_mmio_private,
+						   target_pl1_mw, pl1_time_us,
+						   target_pl2_mw, pl2_time_us) == 0) {
+			dev_info(dev, "RAPL MMIO locked to PL1=%u mW, PL2=%u mW\n",
+				 target_pl1_mw, target_pl2_mw);
+		}
+	} else {
+		if (legion_set_power_and_time(&data->rapl_mmio_private,
+					      target_pl1_mw, pl1_time_us,
+					      target_pl2_mw) == 0) {
+			dev_info(dev, "RAPL MMIO set (unlocked) to PL1=%u mW, PL2=%u mW\n",
+				 target_pl1_mw, target_pl2_mw);
+		}
+	}
+}
+
+static int legion_pm_resume(struct device *dev)
+{
+	struct legion_data *data = dev_get_drvdata(dev);
+
+	if (data)
+		legion_apply_mmio_limits(dev, data);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(legion_pm, NULL, legion_pm_resume);
+
+static int legion_probe(struct platform_device *pdev)
+{
+	int err = 0;
+	struct legion_data *data;
+
+	data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	mutex_init(&data->mutex);
+	platform_set_drvdata(pdev, data);
+
+	/* Initialize RAPL MMIO (non-fatal if thermal PCI BAR is absent) */
+	err = legion_rapl_mmio_init(&pdev->dev);
+	if (err)
+		dev_warn(&pdev->dev, "RAPL MMIO device not found (%d), continuing with MSR only\n", err);
+	else
+		legion_apply_mmio_limits(&pdev->dev, data);
+
+	/* Initialize Intel MSR SysFS (/sys/class/legion-intel-msr/intel-msr-0) */
+	err = legion_intel_msr_sysfs_init(&pdev->dev);
+	if (err) {
+		dev_err(&pdev->dev, "Failed to initialize Intel MSR sysfs: %d\n", err);
+		legion_rapl_mmio_exit(&pdev->dev);
+		mutex_destroy(&data->mutex);
+		return err;
+	}
+
+	dev_info(&pdev->dev, "Universal Intel MSR & RAPL MMIO driver loaded\n");
+	return 0;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+static void legion_remove(struct platform_device *pdev)
+#else
+static int legion_remove(struct platform_device *pdev)
+#endif
+{
+	struct legion_data *data = platform_get_drvdata(pdev);
+
+	legion_intel_msr_sysfs_exit(&pdev->dev);
+	legion_rapl_mmio_exit(&pdev->dev);
+
+	if (data)
+		mutex_destroy(&data->mutex);
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+	return 0;
+#endif
+}
+
+static struct platform_driver legion_driver = {
+	.probe  = legion_probe,
+	.remove = legion_remove,
+	.driver = {
+		.name = "lenovo-legion",
+		.pm   = pm_sleep_ptr(&legion_pm),
+	},
+};
+
+static struct platform_device *legion_pdev;
+
+static int __init legion_init(void)
+{
+	int err;
+
+	err = platform_driver_register(&legion_driver);
+	if (err)
+		return err;
+
+	legion_pdev = platform_device_alloc("lenovo-legion", PLATFORM_DEVID_NONE);
+	if (!legion_pdev) {
+		platform_driver_unregister(&legion_driver);
+		return -ENOMEM;
+	}
+
+	err = platform_device_add(legion_pdev);
+	if (err) {
+		platform_device_put(legion_pdev);
+		platform_driver_unregister(&legion_driver);
+		return err;
+	}
+
+	return 0;
+}
+
+static void __exit legion_exit(void)
+{
+	platform_device_unregister(legion_pdev);
+	platform_driver_unregister(&legion_driver);
+}
+
+module_init(legion_init);
+module_exit(legion_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Jaroslav Bolek (Modified by Slikkelas)");
+MODULE_DESCRIPTION("Universal Intel MSR Undervolt, Ratio & RAPL MMIO Lock Driver");
+MODULE_VERSION("2.0.0");
+// SPDX-License-Identifier: GPL-2.0
+#include "legion-intel-msr.h"
+
+#include <linux/kernel.h>
+#include <linux/cleanup.h>
+#include <asm/msr.h>
+#include <linux/smp.h>
+#include <linux/sysfs.h>
+#include <linux/delay.h>
+#include <linux/cpu.h>
+#include <asm/cpu_device_id.h>
+#include <linux/cpufreq.h>
+#include <asm/processor.h>
+
+#define MSR_VOLTAGE_OFFSET 0x150
+#define MSR_OC_MAILBOX     0x150
+
+#define INTEL_HYBRID_CORE_TYPE_PCORE 0x40
+#define INTEL_HYBRID_CORE_TYPE_ECORE 0x20
+
+#define OC_DOMAIN_PCORE 0
+#define OC_DOMAIN_ECORE 4
+
+struct read_msr_data {
+	int plane;
+	u64 result;
+	int error;
+};
+
+struct vfpoint_data {
+	int domain;
+	int vf_point;
+	int offset_uv;
+	u64 result;
+	int error;
+};
+
+static u32 uv_to_msr(int uv)
+{
+	const s32 offset_units = DIV_ROUND_CLOSEST(uv * 1024, 1000);
+
+	return (u32)offset_units & 0x1FFFFF;
+}
+
+static int msr_to_uv(const u32 msr_value)
+{
+	s32 offset_units = 0;
+	const u32 raw_value = (msr_value >> 21) & 0x7FF;
+
+	if (raw_value & 0x400)
+		offset_units = (s32)(raw_value | 0xFFFFF800);
+	else
+		offset_units = (s32)raw_value;
+
+	return DIV_ROUND_CLOSEST(offset_units * 1000, 1024);
+}
+
+static ssize_t validate_offset(const struct legion_intel_msr_private *intel_msr_private,
+			       const int plane, const int offset_mv)
+{
+	if (plane < 0 || plane >= NUM_VOLTAGE_PLANES)
+		return -EINVAL;
+	if (offset_mv < -intel_msr_private->plane_limits[plane].max_undervolt_uv)
+		return -EINVAL;
+	if (offset_mv > intel_msr_private->plane_limits[plane].max_overvolt_uv)
+		return -EINVAL;
+
+	return 0;
+}
+
+struct cpuid_query {
+	unsigned int eax, ebx, ecx, edx;
+};
+
+static void get_cpuid_1a_work(void *info)
+{
+	struct cpuid_query *res = info;
+
+	cpuid_count(0x1A, 0, &res->eax, &res->ebx, &res->ecx, &res->edx);
+}
+
+static int get_intel_core_type_on_cpu(int cpu)
+{
+	struct cpuid_query res = {0};
+
+	if (cpuid_eax(0) >= 0x1A) {
+		smp_call_function_single(cpu, get_cpuid_1a_work, &res, 1);
+		return (res.eax >> 24) & 0xFF;
+	}
+	return INTEL_HYBRID_CORE_TYPE_PCORE;
+}
+
+ssize_t legion_intel_msr_apply_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
+{
+	int cpu;
+	bool success = false;
+	u32 low = (u32)ratios;
+	u32 high = (u32)(ratios >> 32);
+
+	guard(mutex)(&priv->lock);
+
+	for_each_online_cpu(cpu) {
+		if (get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_PCORE) {
+			if (wrmsr_safe_on_cpu(cpu, MSR_TURBO_RATIO_LIMIT, low, high) == 0)
+				success = true;
+		}
+	}
+	return success ? 0 : -EIO;
+}
+
+ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios)
+{
+	int cpu;
+	u32 low, high;
+
+	guard(mutex)(&priv->lock);
+
+	for_each_online_cpu(cpu) {
+		if (get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_PCORE) {
+			if (rdmsr_safe_on_cpu(cpu, MSR_TURBO_RATIO_LIMIT, &low, &high) == 0) {
+				*ratios = ((u64)high << 32) | low;
+				return 0;
+			}
+		}
+	}
+	return -EIO;
+}
+
+ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios)
+{
+	int cpu;
+	bool success = false;
+	u32 low = (u32)ratios;
+	u32 high = (u32)(ratios >> 32);
+
+	guard(mutex)(&priv->lock);
+
+	for_each_online_cpu(cpu) {
+		if (get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_ECORE) {
+			wrmsr_safe_on_cpu(cpu, MSR_ATOM_CORE_TURBO_RATIOS, low, high);
+			wrmsr_safe_on_cpu(cpu, 0x650, low, high);
+			success = true;
+		}
+	}
+	return success ? 0 : -EIO;
+}
+
+ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios)
+{
+	int cpu;
+	u32 low, high;
+
+	guard(mutex)(&priv->lock);
+
+	for_each_online_cpu(cpu) {
+		if (get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_ECORE) {
+			if (rdmsr_safe_on_cpu(cpu, MSR_ATOM_CORE_TURBO_RATIOS, &low, &high) == 0) {
+				*ratios = ((u64)high << 32) | low;
+				return 0;
+			}
+			if (rdmsr_safe_on_cpu(cpu, 0x650, &low, &high) == 0) {
+				*ratios = ((u64)high << 32) | low;
+				return 0;
+			}
+		}
+	}
+	return -EIO;
+}
+
+struct hwp_ratio_data {
+	int cpu;
+	int target_ratio_human;
+};
+
+static void write_per_core_ratio_on_cpu(void *info)
+{
+	struct hwp_ratio_data *data = info;
+	u32 cap_low, cap_high, req_low, req_high;
+	unsigned int max_freq_khz = cpufreq_quick_get_max(data->cpu);
+
+	if (max_freq_khz == 0)
+		return;
+
+	if (rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0) {
+		u32 hwp_max = cap_low & 0xFF;
+		u32 human_max_ratio = max_freq_khz / 100000;
+		u32 scaled_hwp = DIV_ROUND_CLOSEST(data->target_ratio_human * hwp_max, human_max_ratio);
+
+		if (scaled_hwp > hwp_max)
+			scaled_hwp = hwp_max;
+
+		if (rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
+			req_low &= ~(0xFF << 8);
+			req_low |= ((scaled_hwp & 0xFF) << 8);
+			wrmsr_safe(MSR_HWP_REQUEST, req_low, req_high);
+		}
+	}
+}
+
+static void read_per_core_ratio_on_cpu(void *info)
+{
+	struct hwp_ratio_data *data = info;
+	u32 cap_low, cap_high, req_low, req_high;
+	unsigned int max_freq_khz = cpufreq_quick_get_max(data->cpu);
+
+	data->target_ratio_human = 0;
+
+	if (max_freq_khz > 0 && rdmsr_safe(MSR_HWP_CAPABILITIES, &cap_low, &cap_high) == 0) {
+		u32 hwp_max = cap_low & 0xFF;
+		u32 human_max_ratio = max_freq_khz / 100000;
+
+		if (hwp_max > 0 && rdmsr_safe(MSR_HWP_REQUEST, &req_low, &req_high) == 0) {
+			u32 active_hwp = (req_low >> 8) & 0xFF;
+
+			data->target_ratio_human = DIV_ROUND_CLOSEST(active_hwp * human_max_ratio, hwp_max);
+		}
+	}
+}
+
+ssize_t legion_intel_msr_set_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int ratio)
+{
+	struct hwp_ratio_data data = { .cpu = cpu, .target_ratio_human = ratio };
+
+	if (ratio < 8 || ratio > 120)
+		return -EINVAL;
+
+	guard(mutex)(&priv->lock);
+	smp_call_function_single(cpu, write_per_core_ratio_on_cpu, &data, 1);
+	return 0;
+}
+
+ssize_t legion_intel_msr_get_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int *ratio)
+{
+	struct hwp_ratio_data data = { .cpu = cpu, .target_ratio_human = 0 };
+
+	guard(mutex)(&priv->lock);
+	smp_call_function_single(cpu, read_per_core_ratio_on_cpu, &data, 1);
+
+	if (data.target_ratio_human == 0)
+		return -EIO;
+
+	*ratio = data.target_ratio_human;
+	return 0;
+}
+
+static void write_vfpoint_offset_on_cpu(void *info)
+{
+	struct vfpoint_data *data = info;
+	const u32 offset_encoded = uv_to_msr(data->offset_uv);
+	u32 low = 0, high = 0;
+	const u64 msr_val = ((u64)1 << 63) |
+			    ((u64)(data->domain & 0xFF) << 40) |
+			    ((u64)0x11 << 32) |
+			    ((u64)(offset_encoded & 0x7FF) << 21) |
+			    ((u64)(data->vf_point & 0xFF) << 8);
+
+	int err = wrmsr_safe(MSR_VOLTAGE_OFFSET, (u32)msr_val, (u32)(msr_val >> 32));
+	if (err) {
+		data->error = err;
+		return;
+	}
+
+	int timeout = 100;
+	do {
+		udelay(10);
+		err = rdmsr_safe(MSR_VOLTAGE_OFFSET, &low, &high);
+		if (err) {
+			data->error = err;
+			return;
+		}
+	} while ((high & 0x80000000) && --timeout);
+
+	if (timeout == 0) {
+		data->error = -ETIMEDOUT;
+		return;
+	}
+
+	if ((high & 0xFF) != 0) {
+		data->error = -(high & 0xFF);
+		return;
+	}
+
+	data->error = 0;
+}
+
+static void read_vfpoint_offset_on_cpu(void *info)
+{
+	struct vfpoint_data *data = info;
+	u32 low = 0, high = 0;
+	const u64 msr_val = ((u64)1 << 63) |
+			    ((u64)(data->domain & 0xFF) << 40) |
+			    ((u64)0x10 << 32) |
+			    ((u64)(data->vf_point & 0xFF) << 8);
+
+	int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
+	if (err) {
+		data->error = err;
+		return;
+	}
+
+	udelay(10);
+	err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
+	if (err) {
+		data->error = err;
+		return;
+	}
+
+	data->result = ((u64)high << 32) | low;
+	data->error = 0;
+}
+
+ssize_t legion_intel_msr_pcore_vfpoint_offset_show(struct legion_intel_msr_private *priv, char *buf)
+{
+	ssize_t len = 0;
+
+	guard(mutex)(&priv->lock);
+
+	for (int i = 1; i <= 15; i++) {
+		struct vfpoint_data data = { .domain = OC_DOMAIN_PCORE, .vf_point = i, .error = -1 };
+
+		smp_call_function_single(0, read_vfpoint_offset_on_cpu, &data, 1);
+		if (!data.error) {
+			int offset_mv = msr_to_uv((u32)data.result);
+
+			len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
+		} else {
+			len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERR %d\n", i, data.error);
+		}
+	}
+	return len;
+}
+
+ssize_t legion_intel_msr_pcore_vfpoint_offset_store(struct legion_intel_msr_private *priv, const char *buf, size_t count)
+{
+	int vf_point, offset_mv;
+
+	if (sscanf(buf, "%d %d", &vf_point, &offset_mv) != 2)
+		return -EINVAL;
+	if (vf_point < 1 || vf_point > 15)
+		return -EINVAL;
+
+	struct vfpoint_data data = {
+		.domain = OC_DOMAIN_PCORE,
+		.vf_point = vf_point,
+		.offset_uv = offset_mv
+	};
+
+	guard(mutex)(&priv->lock);
+	on_each_cpu(write_vfpoint_offset_on_cpu, &data, 1);
+
+	if (data.error)
+		return -EIO;
+
+	return count;
+}
+
+ssize_t legion_intel_msr_ecore_vfpoint_offset_show(struct legion_intel_msr_private *priv, char *buf)
+{
+	ssize_t len = 0;
+
+	guard(mutex)(&priv->lock);
+
+	for (int i = 1; i <= 7; i++) {
+		struct vfpoint_data data = { .domain = OC_DOMAIN_ECORE, .vf_point = i, .error = -1 };
+
+		smp_call_function_single(0, read_vfpoint_offset_on_cpu, &data, 1);
+		if (!data.error) {
+			int offset_mv = msr_to_uv((u32)data.result);
+
+			len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %d\n", i, offset_mv);
+		} else {
+			len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERR %d\n", i, data.error);
+		}
+	}
+	return len;
+}
+
+ssize_t legion_intel_msr_ecore_vfpoint_offset_store(struct legion_intel_msr_private *priv, const char *buf, size_t count)
+{
+	int vf_point, offset_mv;
+
+	if (sscanf(buf, "%d %d", &vf_point, &offset_mv) != 2)
+		return -EINVAL;
+	if (vf_point < 1 || vf_point > 7)
+		return -EINVAL;
+
+	struct vfpoint_data data = {
+		.domain = OC_DOMAIN_ECORE,
+		.vf_point = vf_point,
+		.offset_uv = offset_mv
+	};
+
+	guard(mutex)(&priv->lock);
+	on_each_cpu(write_vfpoint_offset_on_cpu, &data, 1);
+
+	if (data.error)
+		return -EIO;
+
+	return count;
+}
+
+static void read_vfpoint_ratio_on_cpu(void *info)
+{
+	struct vfpoint_data *data = info;
+	u32 low = 0, high = 0;
+	const u64 msr_val = ((u64)1 << 63) |
+			    ((u64)(data->domain & 0xFF) << 40) |
+			    ((u64)0x10 << 32) |
+			    ((u64)(data->vf_point & 0xFF) << 8);
+
+	int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
+	if (err) {
+		data->error = err;
+		return;
+	}
+
+	int timeout = 100;
+	do {
+		udelay(10);
+		err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
+		if (err) {
+			data->error = err;
+			return;
+		}
+	} while ((high & 0x80000000) && --timeout);
+
+	if (timeout == 0) {
+		data->error = -ETIMEDOUT;
+		return;
+	}
+
+	if ((high & 0xFF) != 0) {
+		data->error = -(high & 0xFF);
+		return;
+	}
+
+	data->result = (low >> 8) & 0xFF;
+	data->error = 0;
+}
+
+ssize_t legion_intel_msr_pcore_vfpoint_freq_show(struct legion_intel_msr_private *priv, char *buf)
+{
+	ssize_t len = 0;
+
+	guard(mutex)(&priv->lock);
+
+	for (int i = 1; i <= 15; i++) {
+		struct vfpoint_data data = { .domain = OC_DOMAIN_PCORE, .vf_point = i, .error = -1 };
+
+		smp_call_function_single(0, read_vfpoint_ratio_on_cpu, &data, 1);
+		if (!data.error)
+			len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %llu\n", i, data.result);
+		else
+			len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERR %d\n", i, data.error);
+	}
+	return len;
+}
+
+ssize_t legion_intel_msr_ecore_vfpoint_freq_show(struct legion_intel_msr_private *priv, char *buf)
+{
+	ssize_t len = 0;
+
+	guard(mutex)(&priv->lock);
+
+	for (int i = 1; i <= 7; i++) {
+		struct vfpoint_data data = { .domain = OC_DOMAIN_ECORE, .vf_point = i, .error = -1 };
+
+		smp_call_function_single(0, read_vfpoint_ratio_on_cpu, &data, 1);
+		if (!data.error)
+			len += scnprintf(buf + len, PAGE_SIZE - len, "%d: %llu\n", i, data.result);
+		else
+			len += scnprintf(buf + len, PAGE_SIZE - len, "%d: ERR %d\n", i, data.error);
+	}
+	return len;
+}
+
+static void bruteforce_domains_on_cpu(void *info)
+{
+	int cpu = smp_processor_id();
+	u32 low = 0, high = 0;
+
+	for (u64 domain = 0x0; domain <= 0xFF; domain++) {
+		u32 offset_encoded = uv_to_msr(0);
+		u64 msr_val = ((u64)1 << 63) |
+			      (domain << 40) |
+			      ((u64)0x11 << 32) |
+			      ((u64)(offset_encoded & 0x7FF) << 21) |
+			      ((u64)1 << 8);
+
+		if (wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32)))
+			continue;
+
+		int timeout = 100;
+		do {
+			udelay(10);
+			if (rdmsr_safe(MSR_OC_MAILBOX, &low, &high))
+				break;
+		} while ((high & 0x80000000) && --timeout);
+
+		if (timeout == 0)
+			continue;
+
+		u8 pcu_status = high & 0xFF;
+		if (pcu_status == 0)
+			pr_info("legion-intel-msr: CPU %d accepted Domain 0x%02llX\n", cpu, domain);
+	}
+}
+
+ssize_t legion_intel_msr_bruteforce_store(struct legion_intel_msr_private *priv, const char *buf, size_t count)
+{
+	int pcore_target = -1;
+	int ecore_target = -1;
+	int cpu;
+
+	for_each_online_cpu(cpu) {
+		if (pcore_target == -1 && get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_PCORE)
+			pcore_target = cpu;
+		if (ecore_target == -1 && get_intel_core_type_on_cpu(cpu) == INTEL_HYBRID_CORE_TYPE_ECORE)
+			ecore_target = cpu;
+	}
+
+	if (pcore_target != -1)
+		smp_call_function_single(pcore_target, bruteforce_domains_on_cpu, NULL, 1);
+	if (ecore_target != -1)
+		smp_call_function_single(ecore_target, bruteforce_domains_on_cpu, NULL, 1);
+
+	return count;
+}
+
+ssize_t legion_intel_msr_bruteforce_read_store(struct legion_intel_msr_private *priv, const char *buf, size_t count)
+{
+	u32 target_domain;
+	u32 low = 0, high = 0;
+
+	if (kstrtouint(buf, 0, &target_domain) || target_domain > 0xFF)
+		return -EINVAL;
+
+	for (int index = 0; index <= 0xFF; index++) {
+		u64 msr_val = ((u64)1 << 63) |
+			      ((u64)(target_domain & 0xFF) << 40) |
+			      ((u64)0x10 << 32) |
+			      ((u64)(index & 0xFF) << 8);
+
+		preempt_disable();
+		if (wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32))) {
+			preempt_enable();
+			continue;
+		}
+
+		int timeout = 100;
+		do {
+			udelay(10);
+			if (rdmsr_safe(MSR_OC_MAILBOX, &low, &high))
+				break;
+		} while ((high & 0x80000000) && --timeout);
+		preempt_enable();
+
+		if (timeout == 0)
+			continue;
+
+		if ((high & 0xFF) == 0) {
+			int offset_mv = msr_to_uv(low);
+			u8 ratio = (low >> 8) & 0xFF;
+
+			pr_info("legion-intel-msr: [Domain 0x%02X] Index 0x%02X -> %dmV, Ratio: %d\n",
+				target_domain, index, offset_mv, ratio);
+		}
+	}
+
+	return count;
+}
+
+static void write_voltage_offset_on_cpu(void *info)
+{
+	const struct {
+		int plane;
+		int offset_uv;
+	} *data = info;
+
+	const u32 offset_encoded = uv_to_msr(data->offset_uv);
+	const u64 msr_val = ((u64)1 << 63) |
+			    ((u64)(data->plane & 0xFF) << 40) |
+			    ((u64)0x11 << 32) |
+			    ((u64)(offset_encoded & 0x7FF) << 21);
+
+	wrmsr_safe(MSR_VOLTAGE_OFFSET, (const u32)msr_val, (const u32)(msr_val >> 32));
+}
+
+static void read_voltage_offset_on_cpu(void *info)
+{
+	struct read_msr_data *data = info;
+	u32 low = 0, high = 0;
+	const u64 msr_val = ((u64)1 << 63) |
+			    ((u64)(data->plane & 0xFF) << 40) |
+			    ((u64)0x10 << 32);
+
+	int err = wrmsr_safe(MSR_OC_MAILBOX, (u32)msr_val, (u32)(msr_val >> 32));
+	if (err) {
+		data->error = err;
+		return;
+	}
+
+	udelay(10);
+	err = rdmsr_safe(MSR_OC_MAILBOX, &low, &high);
+	if (err) {
+		data->error = err;
+		return;
+	}
+
+	data->result = ((u64)high << 32) | low;
+	data->error = 0;
+}
+
+static void read_voltage_limits(struct legion_intel_msr_private *intel_msr_private)
+{
+	for (int i = 0; i < NUM_VOLTAGE_PLANES; i++)
+		intel_msr_private->plane_limits[i].write_supported = 1;
+
+	if (boot_cpu_data.x86_model == 0xAA || boot_cpu_data.x86_model == 0xAC ||
+	    boot_cpu_data.x86_model == 0xC5 || boot_cpu_data.x86_model == 0xC6 ||
+	    boot_cpu_data.x86_model == 0xB5) {
+		intel_msr_private->plane_limits[PLANE_UNCORE].write_supported = 0;
+		intel_msr_private->plane_limits[PLANE_ANALOGIO].write_supported = 0;
+	}
+}
+
+static int legion_intel_msr_check_msr_availability(struct legion_intel_msr_private *intel_msr_private)
+{
+	u32 low = 0, high = 0;
+
+	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL || boot_cpu_data.x86 < 6)
+		return -ENODEV;
+
+	if (rdmsr_safe_on_cpu(0, MSR_OC_MAILBOX, &low, &high))
+		return -ENODEV;
+
+	read_voltage_limits(intel_msr_private);
+	return 0;
+}
+
+ssize_t legion_intel_msr_offset_read_show(struct legion_intel_msr_private *intel_msr_private,
+					  const int plane, int *offset_uv)
+{
+	struct read_msr_data data = { .plane = plane, .error = -1 };
+
+	guard(mutex)(&intel_msr_private->lock);
+	smp_call_function_single(0, read_voltage_offset_on_cpu, &data, 1);
+
+	if (data.error)
+		return data.error;
+
+	*offset_uv = msr_to_uv((u32)data.result);
+	return 0;
+}
+
+ssize_t legion_intel_msr_apply_voltage_offset(struct legion_intel_msr_private *intel_msr_private,
+					      const int plane, const int offset_uv)
+{
+	struct {
+		int plane;
+		int offset_uv;
+	} data = { .plane = plane, .offset_uv = offset_uv };
+
+	guard(mutex)(&intel_msr_private->lock);
+
+	if (!intel_msr_private->plane_limits[plane].write_supported)
+		return -EOPNOTSUPP;
+
+	const ssize_t ret = validate_offset(intel_msr_private, data.plane, data.offset_uv);
+	if (ret < 0)
+		return ret;
+
+	on_each_cpu(write_voltage_offset_on_cpu, &data, 1);
+	return 0;
+}
+
+int legion_intel_msr_init(struct legion_intel_msr_private *intel_msr_private)
+{
+	mutex_init(&intel_msr_private->lock);
+
+	for (int i = 0; i < NUM_VOLTAGE_PLANES; i++) {
+		intel_msr_private->plane_limits[i].max_undervolt_uv = DEFAULT_MAX_UNDERVOLT_UV;
+		intel_msr_private->plane_limits[i].max_overvolt_uv = DEFAULT_MAX_OVERVOLT_UV;
+	}
+
+	return legion_intel_msr_check_msr_availability(intel_msr_private);
+}
+
+void legion_intel_msr_exit(struct legion_intel_msr_private *intel_msr_private)
+{
+	mutex_destroy(&intel_msr_private->lock);
+}
+// SPDX-License-Identifier: GPL-2.0
+#ifndef LEGION_INTEL_MSR_H_
+#define LEGION_INTEL_MSR_H_
+
+#include <linux/mutex.h>
+#include <linux/types.h>
+
+#define PLANE_CPU        0
+#define PLANE_GPU        1
+#define PLANE_CACHE      2
+#define PLANE_UNCORE     3
+#define PLANE_ANALOGIO   4
+#define NUM_VOLTAGE_PLANES 5
+
+#ifndef MSR_TURBO_RATIO_LIMIT
+#define MSR_TURBO_RATIO_LIMIT 0x1AD
+#endif
+#ifndef MSR_ATOM_CORE_TURBO_RATIOS
+#define MSR_ATOM_CORE_TURBO_RATIOS 0x66C
+#endif
+#ifndef MSR_ATOM_CORE_RATIOS
+#define MSR_ATOM_CORE_RATIOS 0x66A
+#endif
+#ifndef MSR_HWP_CAPABILITIES
+#define MSR_HWP_CAPABILITIES 0x771
+#endif
+#ifndef MSR_HWP_REQUEST
+#define MSR_HWP_REQUEST 0x774
+#endif
+
+#define DEFAULT_MAX_UNDERVOLT_UV 150
+#define DEFAULT_MAX_OVERVOLT_UV  150
+
+struct legion_intel_voltage_limits {
+	int max_undervolt_uv;
+	int max_overvolt_uv;
+	int write_supported;
+};
+
+struct legion_intel_msr_private {
+	struct legion_intel_voltage_limits plane_limits[NUM_VOLTAGE_PLANES];
+	struct mutex lock;
+};
+
+ssize_t legion_intel_msr_apply_voltage_offset(struct legion_intel_msr_private *intel_msr_private, int plane, int offset_uv);
+ssize_t legion_intel_msr_offset_read_show(struct legion_intel_msr_private *intel_msr_private, int plane, int *offset_uv);
+ssize_t legion_intel_msr_apply_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios);
+ssize_t legion_intel_msr_read_pcore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios);
+ssize_t legion_intel_msr_apply_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 ratios);
+ssize_t legion_intel_msr_read_ecore_active_ratios(struct legion_intel_msr_private *priv, u64 *ratios);
+ssize_t legion_intel_msr_set_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int ratio);
+ssize_t legion_intel_msr_get_per_core_ratio(struct legion_intel_msr_private *priv, int cpu, int *ratio);
+ssize_t legion_intel_msr_pcore_vfpoint_offset_show(struct legion_intel_msr_private *priv, char *buf);
+ssize_t legion_intel_msr_pcore_vfpoint_offset_store(struct legion_intel_msr_private *priv, const char *buf, size_t count);
+ssize_t legion_intel_msr_ecore_vfpoint_offset_show(struct legion_intel_msr_private *priv, char *buf);
+ssize_t legion_intel_msr_ecore_vfpoint_offset_store(struct legion_intel_msr_private *priv, const char *buf, size_t count);
+ssize_t legion_intel_msr_pcore_vfpoint_freq_show(struct legion_intel_msr_private *priv, char *buf);
+ssize_t legion_intel_msr_ecore_vfpoint_freq_show(struct legion_intel_msr_private *priv, char *buf);
+ssize_t legion_intel_msr_bruteforce_store(struct legion_intel_msr_private *priv, const char *buf, size_t count);
+ssize_t legion_intel_msr_bruteforce_read_store(struct legion_intel_msr_private *priv, const char *buf, size_t count);
+
+int  legion_intel_msr_init(struct legion_intel_msr_private *intel_msr_private);
+void legion_intel_msr_exit(struct legion_intel_msr_private *intel_msr_private);
+
+#endif /* LEGION_INTEL_MSR_H_ */
+// SPDX-License-Identifier: GPL-2.0
+#include "legion-common.h"
+#include "legion-intel-msr.h"
+#include "legion-rapl-mmio.h"
+
+#include <linux/device.h>
+#include <linux/gfp_types.h>
+#include <linux/idr.h>
+
+#define LEGION_INTEL_MSR_BASE_PATH "intel-msr"
+
+static DEFINE_IDA(legion_intel_msr_sysfs_ida);
+
+static int legion_intel_msr_dev_uevent(const struct device *dev, struct kobj_uevent_env *env)
+{
+	return add_uevent_var(env, "DRIVER=legion-intel-msr");
+}
+
+static const struct class legion_intel_msr_class = {
+	.name = "legion-intel-msr",
+	.dev_uevent = legion_intel_msr_dev_uevent,
+};
+
+static ssize_t send_event(struct device *dev, const enum legion_events_type type, const int value)
+{
+	char event_type[64] = {0};
+	char event_value[64] = {0};
+	char *envp[] = { event_type, event_value, NULL };
+
+	snprintf(event_type, sizeof(event_type), "EVENT_TYPE=%u", (unsigned int)type);
+	snprintf(event_value, sizeof(event_value), "EVENT_VALUE=%d", value);
+
+	if (kobject_uevent_env(&dev->kobj, KOBJ_CHANGE, envp))
+		dev_err(dev, "Failed to send uevent for attribute change\n");
+
+	return 0;
+}
+
+static ssize_t mmio_lock_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	bool is_locked = false;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	if (legion_is_locked_power_read(&priv->rapl_mmio_private, &is_locked))
+		return -ENODEV;
+
+	return sysfs_emit(buf, "%d\n", is_locked ? 1 : 0);
+}
+
+static ssize_t mmio_lock_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	unsigned int val = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	if (kstrtouint(buf, 10, &val) || val != 1)
+		return -EINVAL;
+
+	/* Sync current CPU MSR 0x610 values to MMIO and set the hardware lock bit */
+	if (legion_sync_msr_to_mmio(&priv->rapl_mmio_private, true))
+		return -EIO;
+
+	return count;
+}
+
+static ssize_t cpu_offset_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	int mv_offset = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	const ssize_t ret = legion_intel_msr_offset_read_show(&priv->intel_msr_private, PLANE_CPU, &mv_offset);
+	if (ret)
+		return ret;
+
+	return sprintf(buf, "%d\n", mv_offset);
+}
+
+static ssize_t cpu_offset_store(struct device *dev, struct device_attribute *attr, const char *buf, const size_t count)
+{
+	int cpu_offset = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	if (kstrtoint(buf, 10, &cpu_offset))
+		return -EINVAL;
+
+	legion_intel_msr_apply_voltage_offset(&priv->intel_msr_private, PLANE_CPU, cpu_offset);
+	send_event(dev, LENOVO_INTEL_MSR_PLANE_CPU, cpu_offset);
+	return (ssize_t)count;
+}
+
+static ssize_t cache_offset_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	int mv_offset = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	const ssize_t ret = legion_intel_msr_offset_read_show(&priv->intel_msr_private, PLANE_CACHE, &mv_offset);
+	if (ret)
+		return ret;
+
+	return sprintf(buf, "%d\n", mv_offset);
+}
+
+static ssize_t cache_offset_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int cache_offset = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	const ssize_t ret = kstrtoint(buf, 10, &cache_offset);
+	if (ret < 0)
+		return ret;
+
+	legion_intel_msr_apply_voltage_offset(&priv->intel_msr_private, PLANE_CACHE, cache_offset);
+	send_event(dev, LENOVO_INTEL_MSR_PLANE_CACHE, cache_offset);
+	return (ssize_t)count;
+}
+
+static ssize_t gpu_offset_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	int mv_offset = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	const ssize_t ret = legion_intel_msr_offset_read_show(&priv->intel_msr_private, PLANE_GPU, &mv_offset);
+	if (ret)
+		return ret;
+
+	return sprintf(buf, "%d\n", mv_offset);
+}
+
+static ssize_t gpu_offset_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int gpu_offset = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	const ssize_t ret = kstrtoint(buf, 10, &gpu_offset);
+	if (ret < 0)
+		return ret;
+
+	legion_intel_msr_apply_voltage_offset(&priv->intel_msr_private, PLANE_GPU, gpu_offset);
+	send_event(dev, LENOVO_INTEL_MSR_PLANE_GPU, gpu_offset);
+	return (ssize_t)count;
+}
+
+static ssize_t uncore_offset_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	int mv_offset = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	const ssize_t ret = legion_intel_msr_offset_read_show(&priv->intel_msr_private, PLANE_UNCORE, &mv_offset);
+	if (ret)
+		return ret;
+
+	return sprintf(buf, "%d\n", mv_offset);
+}
+
+static ssize_t uncore_offset_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int uncore_offset = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	const ssize_t ret = kstrtoint(buf, 10, &uncore_offset);
+	if (ret < 0)
+		return ret;
+
+	legion_intel_msr_apply_voltage_offset(&priv->intel_msr_private, PLANE_UNCORE, uncore_offset);
+	send_event(dev, LENOVO_INTEL_MSR_PLANE_UNCORE, uncore_offset);
+	return (ssize_t)count;
+}
+
+static ssize_t analogio_offset_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	int mv_offset = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	const ssize_t ret = legion_intel_msr_offset_read_show(&priv->intel_msr_private, PLANE_ANALOGIO, &mv_offset);
+	if (ret)
+		return ret;
+
+	return sprintf(buf, "%d\n", mv_offset);
+}
+
+static ssize_t analogio_offset_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+	int analogio_offset = 0;
+
+	if (!priv)
+		return -ENODEV;
+
+	const ssize_t ret = kstrtoint(buf, 10, &analogio_offset);
+	if (ret < 0)
+		return ret;
+
+	legion_intel_msr_apply_voltage_offset(&priv->intel_msr_private, PLANE_ANALOGIO, analogio_offset);
+	send_event(dev, LENOVO_INTEL_MSR_PLANE_ANALOGIO, analogio_offset);
+	return (ssize_t)count;
+}
+
+static ssize_t pcore_active_ratios_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	u64 result = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	if (legion_intel_msr_read_pcore_active_ratios(&priv->intel_msr_private, &result) < 0)
+		return -EIO;
+
+	u32 low = (u32)result;
+	u32 high = (u32)(result >> 32);
+
+	return sprintf(buf, "%d %d %d %d %d %d %d %d\n",
+		       low & 0xFF, (low >> 8) & 0xFF, (low >> 16) & 0xFF, (low >> 24) & 0xFF,
+		       high & 0xFF, (high >> 8) & 0xFF, (high >> 16) & 0xFF, (high >> 24) & 0xFF);
+}
+
+static ssize_t pcore_active_ratios_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int r[8] = {0};
+	u64 msr_val = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	if (sscanf(buf, "%d %d %d %d %d %d %d %d", &r[0], &r[1], &r[2], &r[3], &r[4], &r[5], &r[6], &r[7]) != 8)
+		return -EINVAL;
+
+	for (int i = 0; i < 8; i++) {
+		if ((r[i] < 8 && r[i] != 0) || r[i] > 255)
+			return -EINVAL;
+		msr_val |= ((u64)r[i] << (i * 8));
+	}
+
+	if (legion_intel_msr_apply_pcore_active_ratios(&priv->intel_msr_private, msr_val) < 0)
+		return -EIO;
+	return count;
+}
+
+static ssize_t ecore_active_ratios_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	u64 result = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	if (legion_intel_msr_read_ecore_active_ratios(&priv->intel_msr_private, &result) < 0)
+		return -EIO;
+
+	u32 low = (u32)result;
+	u32 high = (u32)(result >> 32);
+
+	return sprintf(buf, "%d %d %d %d %d %d %d %d\n",
+		       low & 0xFF, (low >> 8) & 0xFF, (low >> 16) & 0xFF, (low >> 24) & 0xFF,
+		       high & 0xFF, (high >> 8) & 0xFF, (high >> 16) & 0xFF, (high >> 24) & 0xFF);
+}
+
+static ssize_t ecore_active_ratios_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int r[8] = {0};
+	u64 msr_val = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	if (sscanf(buf, "%d %d %d %d %d %d %d %d", &r[0], &r[1], &r[2], &r[3], &r[4], &r[5], &r[6], &r[7]) != 8)
+		return -EINVAL;
+
+	for (int i = 0; i < 8; i++) {
+		if ((r[i] < 8 && r[i] != 0) || r[i] > 255)
+			return -EINVAL;
+		if (i > 0 && r[i] > r[i - 1] && r[i] != 0)
+			return -EINVAL;
+		msr_val |= ((u64)r[i] << (i * 8));
+	}
+
+	if (legion_intel_msr_apply_ecore_active_ratios(&priv->intel_msr_private, msr_val) < 0)
+		return -EIO;
+	return count;
+}
+
+static ssize_t core_ratio_limit_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+	int cpu, ratio, len = 0;
+
+	if (!priv)
+		return -ENODEV;
+
+	for_each_online_cpu(cpu) {
+		if (legion_intel_msr_get_per_core_ratio(&priv->intel_msr_private, cpu, &ratio) == 0)
+			len += sprintf(buf + len, "CPU%d: %d\n", cpu, ratio);
+	}
+	return len;
+}
+
+static ssize_t core_ratio_limit_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int target_cpu = 0, ratio = 0;
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	if (sscanf(buf, "%d %d", &target_cpu, &ratio) != 2)
+		return -EINVAL;
+
+	if (target_cpu == -1) {
+		int cpu;
+
+		for_each_online_cpu(cpu)
+			legion_intel_msr_set_per_core_ratio(&priv->intel_msr_private, cpu, ratio);
+	} else {
+		if (!cpu_online(target_cpu))
+			return -EINVAL;
+		legion_intel_msr_set_per_core_ratio(&priv->intel_msr_private, target_cpu, ratio);
+	}
+	return count;
+}
+
+static ssize_t pcore_vfpoint_offset_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return legion_intel_msr_pcore_vfpoint_offset_show(&priv->intel_msr_private, buf);
+}
+
+static ssize_t pcore_vfpoint_offset_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	ssize_t ret = legion_intel_msr_pcore_vfpoint_offset_store(&priv->intel_msr_private, buf, count);
+	if (ret > 0)
+		send_event(dev, LENOVO_INTEL_MSR_PLANE_CPU, 0);
+	return ret;
+}
+
+static ssize_t ecore_vfpoint_offset_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return legion_intel_msr_ecore_vfpoint_offset_show(&priv->intel_msr_private, buf);
+}
+
+static ssize_t ecore_vfpoint_offset_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+
+	ssize_t ret = legion_intel_msr_ecore_vfpoint_offset_store(&priv->intel_msr_private, buf, count);
+	if (ret > 0)
+		send_event(dev, LENOVO_INTEL_MSR_PLANE_CPU, 0);
+	return ret;
+}
+
+static ssize_t pcore_vfpoint_freq_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return legion_intel_msr_pcore_vfpoint_freq_show(&priv->intel_msr_private, buf);
+}
+
+static ssize_t ecore_vfpoint_freq_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return legion_intel_msr_ecore_vfpoint_freq_show(&priv->intel_msr_private, buf);
+}
+
+static ssize_t bruteforce_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return legion_intel_msr_bruteforce_store(&priv->intel_msr_private, buf, count);
+}
+
+static ssize_t bruteforce_read_domain_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return legion_intel_msr_bruteforce_read_store(&priv->intel_msr_private, buf, count);
+}
+
+static ssize_t cpu_max_undervolt_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CPU].max_undervolt_uv);
+}
+
+static ssize_t cpu_max_overvolt_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CPU].max_overvolt_uv);
+}
+
+static ssize_t cache_max_undervolt_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CACHE].max_undervolt_uv);
+}
+
+static ssize_t cache_max_overvolt_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CACHE].max_overvolt_uv);
+}
+
+static ssize_t gpu_max_undervolt_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_GPU].max_undervolt_uv);
+}
+
+static ssize_t gpu_max_overvolt_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_GPU].max_overvolt_uv);
+}
+
+static ssize_t uncore_max_undervolt_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_UNCORE].max_undervolt_uv);
+}
+
+static ssize_t uncore_max_overvolt_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_UNCORE].max_overvolt_uv);
+}
+
+static ssize_t cpu_offset_ctrl_supported_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CPU].write_supported);
+}
+
+static ssize_t cache_offset_ctrl_supported_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_CACHE].write_supported);
+}
+
+static ssize_t gpu_offset_ctrl_supported_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_GPU].write_supported);
+}
+
+static ssize_t uncore_offset_ctrl_supported_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_UNCORE].write_supported);
+}
+
+static ssize_t analogio_offset_ctrl_supported_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_ANALOGIO].write_supported);
+}
+
+static ssize_t analogio_max_undervolt_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_ANALOGIO].max_undervolt_uv);
+}
+
+static ssize_t analogio_max_overvolt_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct legion_data *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", priv->intel_msr_private.plane_limits[PLANE_ANALOGIO].max_overvolt_uv);
+}
+
+static DEVICE_ATTR_RW(mmio_lock);
+static DEVICE_ATTR_RW(cpu_offset);
+static DEVICE_ATTR_RW(cache_offset);
+static DEVICE_ATTR_RW(gpu_offset);
+static DEVICE_ATTR_RW(uncore_offset);
+static DEVICE_ATTR_RW(analogio_offset);
+
+static DEVICE_ATTR_RO(cpu_max_undervolt);
+static DEVICE_ATTR_RO(cpu_max_overvolt);
+static DEVICE_ATTR_RO(cache_max_undervolt);
+static DEVICE_ATTR_RO(cache_max_overvolt);
+static DEVICE_ATTR_RO(gpu_max_undervolt);
+static DEVICE_ATTR_RO(gpu_max_overvolt);
+static DEVICE_ATTR_RO(uncore_max_undervolt);
+static DEVICE_ATTR_RO(uncore_max_overvolt);
+static DEVICE_ATTR_RO(analogio_max_undervolt);
+static DEVICE_ATTR_RO(analogio_max_overvolt);
+
+static DEVICE_ATTR_RO(cpu_offset_ctrl_supported);
+static DEVICE_ATTR_RO(cache_offset_ctrl_supported);
+static DEVICE_ATTR_RO(gpu_offset_ctrl_supported);
+static DEVICE_ATTR_RO(uncore_offset_ctrl_supported);
+static DEVICE_ATTR_RO(analogio_offset_ctrl_supported);
+
+static DEVICE_ATTR_RW(pcore_active_ratios);
+static DEVICE_ATTR_RW(ecore_active_ratios);
+static DEVICE_ATTR_RW(core_ratio_limit);
+static DEVICE_ATTR_RW(pcore_vfpoint_offset);
+static DEVICE_ATTR_RW(ecore_vfpoint_offset);
+static DEVICE_ATTR_RO(pcore_vfpoint_freq);
+static DEVICE_ATTR_RO(ecore_vfpoint_freq);
+static DEVICE_ATTR_WO(bruteforce);
+static DEVICE_ATTR_WO(bruteforce_read_domain);
+
+static struct attribute *legion_intel_msr_sysfs_attributes[] = {
+	&dev_attr_mmio_lock.attr,
+	&dev_attr_cpu_offset.attr,
+	&dev_attr_cache_offset.attr,
+	&dev_attr_gpu_offset.attr,
+	&dev_attr_uncore_offset.attr,
+	&dev_attr_analogio_offset.attr,
+	&dev_attr_pcore_active_ratios.attr,
+	&dev_attr_ecore_active_ratios.attr,
+	&dev_attr_core_ratio_limit.attr,
+	&dev_attr_pcore_vfpoint_offset.attr,
+	&dev_attr_ecore_vfpoint_offset.attr,
+	&dev_attr_pcore_vfpoint_freq.attr,
+	&dev_attr_ecore_vfpoint_freq.attr,
+	&dev_attr_bruteforce.attr,
+	&dev_attr_bruteforce_read_domain.attr,
+	&dev_attr_cpu_max_undervolt.attr,
+	&dev_attr_cpu_max_overvolt.attr,
+	&dev_attr_cache_max_undervolt.attr,
+	&dev_attr_cache_max_overvolt.attr,
+	&dev_attr_gpu_max_undervolt.attr,
+	&dev_attr_gpu_max_overvolt.attr,
+	&dev_attr_uncore_max_undervolt.attr,
+	&dev_attr_uncore_max_overvolt.attr,
+	&dev_attr_analogio_max_undervolt.attr,
+	&dev_attr_analogio_max_overvolt.attr,
+	&dev_attr_cpu_offset_ctrl_supported.attr,
+	&dev_attr_cache_offset_ctrl_supported.attr,
+	&dev_attr_gpu_offset_ctrl_supported.attr,
+	&dev_attr_uncore_offset_ctrl_supported.attr,
+	&dev_attr_analogio_offset_ctrl_supported.attr,
+	NULL
+};
+
+static const struct attribute_group legion_intel_msr_attributes_group = {
+	.attrs = legion_intel_msr_sysfs_attributes
+};
+
+int legion_intel_msr_sysfs_init(struct device *parent)
+{
+	int ret = 0;
+	struct legion_data *data = dev_get_drvdata(parent);
+
+	if (!data)
+		return -ENODEV;
+
+	ret = legion_intel_msr_init(&data->intel_msr_private);
+	if (ret)
+		return ret;
+
+	ret = class_register(&legion_intel_msr_class);
+	if (ret) {
+		legion_intel_msr_exit(&data->intel_msr_private);
+		return ret;
+	}
+
+	ret = data->intel_msr_sysfs_private.ida_id = ida_alloc(&legion_intel_msr_sysfs_ida, GFP_KERNEL);
+	if (data->intel_msr_sysfs_private.ida_id < 0)
+		goto err_unregister_class;
+
+	data->intel_msr_sysfs_private.dev = device_create(&legion_intel_msr_class, parent,
+							  MKDEV(0, 0), data, "%s-%u",
+							  LEGION_INTEL_MSR_BASE_PATH,
+							  data->intel_msr_sysfs_private.ida_id);
+	if (IS_ERR(data->intel_msr_sysfs_private.dev)) {
+		ret = (int)PTR_ERR(data->intel_msr_sysfs_private.dev);
+		goto err_free_ida;
+	}
+
+	ret = device_add_group(data->intel_msr_sysfs_private.dev, &legion_intel_msr_attributes_group);
+	if (ret)
+		goto err_unregister_dev;
+
+	return 0;
+
+err_unregister_dev:
+	device_unregister(data->intel_msr_sysfs_private.dev);
+err_free_ida:
+	ida_free(&legion_intel_msr_sysfs_ida, data->intel_msr_sysfs_private.ida_id);
+err_unregister_class:
+	class_unregister(&legion_intel_msr_class);
+	legion_intel_msr_exit(&data->intel_msr_private);
+	return ret;
+}
+
+void legion_intel_msr_sysfs_exit(const struct device *parent)
+{
+	struct legion_data *data = dev_get_drvdata(parent);
+
+	if (!data)
+		return;
+
+	device_remove_group(data->intel_msr_sysfs_private.dev, &legion_intel_msr_attributes_group);
+	device_unregister(data->intel_msr_sysfs_private.dev);
+	legion_intel_msr_exit(&data->intel_msr_private);
+	ida_free(&legion_intel_msr_sysfs_ida, data->intel_msr_sysfs_private.ida_id);
+	class_unregister(&legion_intel_msr_class);
+}
+// SPDX-License-Identifier: GPL-2.0
+#ifndef LEGION_INTEL_MSR_SYSFS_H_
+#define LEGION_INTEL_MSR_SYSFS_H_
+
+struct device;
+
+struct legion_intel_msr_sysfs_private {
+	int ida_id;
+	struct device *dev;
+};
+
+int  legion_intel_msr_sysfs_init(struct device *parent);
+void legion_intel_msr_sysfs_exit(const struct device *parent);
+
+#endif /* LEGION_INTEL_MSR_SYSFS_H_ */
+// SPDX-License-Identifier: GPL-2.0
+#include "legion-common.h"
+#include "legion-rapl-mmio.h"
+
+#include <linux/cleanup.h>
+#include <linux/pci_ids.h>
+
+#define RAPL_LIMIT_OFFSET 0x59A0
+#define RAPL_PL4_OFFSET   0x59B0
+
+#define RAPL_PL1_MASK       0x7FFF
+#define RAPL_PL1_ENABLE     (1ULL << 15)
+#define RAPL_PL1_CLAMP      (1ULL << 16)
+#define RAPL_PL1_TIME_MASK  0xFE0000
+#define RAPL_PL1_TIME_SHIFT 17
+
+#define RAPL_PL2_MASK       0x7FFF00000000ULL
+#define RAPL_PL2_SHIFT      32
+#define RAPL_PL2_ENABLE     (1ULL << 47)
+#define RAPL_PL2_CLAMP      (1ULL << 48)
+#define RAPL_PL2_TIME_MASK  0xFE000000000000ULL
+#define RAPL_PL2_TIME_SHIFT 49
+
+#define RAPL_PL4_MASK       0x7FFF
+#define RAPL_PL4_ENABLE     (1ULL << 15)
+#define RAPL_PL4_LOCK       (1ULL << 31)
+
+#define RAPL_LOCK_BIT       (1ULL << 63)
+
+#define POWER_UNIT_DIVISOR  8
+
+#define PCI_DEVICE_ID_INTEL_SKL_THERMAL   0x1903
+#define PCI_DEVICE_ID_INTEL_ICL_THERMAL   0x8A03
+#define PCI_DEVICE_ID_INTEL_TGL_THERMAL   0x9A03
+#define PCI_DEVICE_ID_INTEL_ADL_THERMAL   0x461D
+#define PCI_DEVICE_ID_INTEL_RPL_THERMAL   0xA71D
+#define PCI_DEVICE_ID_INTEL_MTLP_THERMAL  0x7D03
+#define PCI_DEVICE_ID_INTEL_LNLM_THERMAL  0x641D
+#define PCI_DEVICE_ID_INTEL_ARL_S_THERMAL 0xAD03
+
+static const u16 supported_thermal_devices[] = {
+	PCI_DEVICE_ID_INTEL_SKL_THERMAL,
+	PCI_DEVICE_ID_INTEL_ICL_THERMAL,
+	PCI_DEVICE_ID_INTEL_TGL_THERMAL,
+	PCI_DEVICE_ID_INTEL_ADL_THERMAL,
+	PCI_DEVICE_ID_INTEL_RPL_THERMAL,
+	PCI_DEVICE_ID_INTEL_MTLP_THERMAL,
+	PCI_DEVICE_ID_INTEL_LNLM_THERMAL,
+	PCI_DEVICE_ID_INTEL_ARL_S_THERMAL,
+	0x0000
+};
+
+static bool is_device_supported(const u16 device_id)
+{
+	for (int i = 0; supported_thermal_devices[i] != 0x0000; i++) {
+		if (supported_thermal_devices[i] == device_id)
+			return true;
+	}
+	return false;
+}
+
+static struct pci_dev *find_thermal_device_by_id(void)
+{
+	struct pci_dev *pdev = NULL;
+
+	/* Universal fast path: Intel Processor Thermal Device is always at 00:04.0 */
+	pdev = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(4, 0));
+	if (pdev) {
+		if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
+		    (is_device_supported(pdev->device) ||
+		     (pdev->class >> 8) == PCI_CLASS_SIGNAL_PROCESSING_OTHER)) {
+			return pdev;
+		}
+		pci_dev_put(pdev);
+		pdev = NULL;
+	}
+
+	while ((pdev = pci_get_device(PCI_VENDOR_ID_INTEL, PCI_ANY_ID, pdev)) != NULL) {
+		if (is_device_supported(pdev->device))
+			return pdev;
+	}
+
+	return NULL;
+}
+
+static unsigned int units_to_watts(const unsigned int units)
+{
+	return (units * 1000) / POWER_UNIT_DIVISOR;
+}
+
+static unsigned int watts_to_units(const unsigned int milliwatts)
+{
+	return (milliwatts * POWER_UNIT_DIVISOR) / 1000;
+}
+
+static unsigned int decode_time_window(const unsigned int encoded)
+{
+	const unsigned int f = (encoded & 0x60) >> 5;
+	const unsigned int y = encoded & 0x1F;
+	unsigned long long time_us = (1ULL << y) * (4 + f) * 1000000ULL / 4;
+
+	return (unsigned int)(time_us >> 10);
+}
+
+static unsigned int encode_time_window(unsigned int time_us)
+{
+	unsigned int f = 0;
+	const unsigned long long time_units = ((unsigned long long)time_us << 10) / 1000000ULL;
+
+	if (time_units == 0)
+		return 0;
+
+	unsigned int y = 0;
+	if (time_units > 1) {
+		for (y = 0; y < 31; y++) {
+			if ((1ULL << (y + 1)) > time_units)
+				break;
+		}
+	}
+
+	if (y > 31)
+		return 0x7F;
+
+	unsigned long long y_val = 1ULL << y;
+	if (time_units >= y_val) {
+		f = (unsigned int)((4 * (time_units - y_val)) / y_val);
+		if (f > 3)
+			f = 3;
+	}
+
+	return (f << 5) | (y & 0x1F);
+}
+
+int legion_rapl_mmio_init(const struct device *parent)
+{
+	struct legion_data *data = dev_get_drvdata(parent);
+	struct legion_rapl_mmio_private *rapl_mmio_private = &data->rapl_mmio_private;
+	const int bar = 0;
+
+	mutex_init(&rapl_mmio_private->lock);
+
+	rapl_mmio_private->thermal_dev = find_thermal_device_by_id();
+	if (!rapl_mmio_private->thermal_dev)
+		return -ENODEV;
+
+	rapl_mmio_private->bar_start = pci_resource_start(rapl_mmio_private->thermal_dev, bar);
+	rapl_mmio_private->bar_len = pci_resource_len(rapl_mmio_private->thermal_dev, bar);
+
+	if (!rapl_mmio_private->bar_start || !rapl_mmio_private->bar_len) {
+		pci_dev_put(rapl_mmio_private->thermal_dev);
+		rapl_mmio_private->thermal_dev = NULL;
+		return -ENODEV;
+	}
+
+	rapl_mmio_private->rapl_mmio_base = ioremap(rapl_mmio_private->bar_start, rapl_mmio_private->bar_len);
+	if (!rapl_mmio_private->rapl_mmio_base) {
+		pci_dev_put(rapl_mmio_private->thermal_dev);
+		rapl_mmio_private->thermal_dev = NULL;
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+void legion_rapl_mmio_exit(const struct device *parent)
+{
+	struct legion_data *data = dev_get_drvdata(parent);
+	struct legion_rapl_mmio_private *rapl_mmio_private = &data->rapl_mmio_private;
+
+	if (rapl_mmio_private->rapl_mmio_base) {
+		iounmap(rapl_mmio_private->rapl_mmio_base);
+		rapl_mmio_private->rapl_mmio_base = NULL;
+	}
+
+	if (rapl_mmio_private->thermal_dev) {
+		pci_dev_put(rapl_mmio_private->thermal_dev);
+		rapl_mmio_private->thermal_dev = NULL;
+	}
+
+	mutex_destroy(&rapl_mmio_private->lock);
+}
+
+int legion_pl1_power_read(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int *pl1)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -ENODEV;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	*pl1 = units_to_watts(rapl_limit & RAPL_PL1_MASK);
+	return 0;
+}
+
+int legion_pl2_power_read(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int *pl2)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -ENODEV;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	*pl2 = units_to_watts((rapl_limit & RAPL_PL2_MASK) >> RAPL_PL2_SHIFT);
+	return 0;
+}
+
+int legion_pl1_time_read(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int *time_us)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -ENODEV;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	*time_us = decode_time_window((rapl_limit & RAPL_PL1_TIME_MASK) >> RAPL_PL1_TIME_SHIFT);
+	return 0;
+}
+
+int legion_pl2_time_read(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int *time_us)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -ENODEV;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	*time_us = decode_time_window((rapl_limit & RAPL_PL2_TIME_MASK) >> RAPL_PL2_TIME_SHIFT);
+	return 0;
+}
+
+int legion_pl4_lock_read(struct legion_rapl_mmio_private *rapl_mmio_private, bool *isLocked)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -ENODEV;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const uint64_t rapl_pl4 = readq(rapl_mmio_private->rapl_mmio_base + RAPL_PL4_OFFSET);
+	*isLocked = (rapl_pl4 & RAPL_PL4_LOCK) ? true : false;
+	return 0;
+}
+
+int legion_pl4_power_read(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int *pl4)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -ENODEV;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const uint64_t rapl_pl4 = readq(rapl_mmio_private->rapl_mmio_base + RAPL_PL4_OFFSET);
+	*pl4 = units_to_watts(rapl_pl4 & RAPL_PL4_MASK);
+	return 0;
+}
+
+int legion_is_locked_power_read(struct legion_rapl_mmio_private *rapl_mmio_private, bool *isLocked)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -ENODEV;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	*isLocked = (rapl_limit & RAPL_LOCK_BIT) ? true : false;
+	return 0;
+}
+
+int legion_lock_current_mmio(struct legion_rapl_mmio_private *rapl_mmio_private)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -ENODEV;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	rapl_limit |= (RAPL_PL1_ENABLE | RAPL_PL2_ENABLE | RAPL_LOCK_BIT);
+	writeq(rapl_limit, rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	return 0;
+}
+
+int legion_pl4_set_and_lock(struct legion_rapl_mmio_private *rapl_mmio_private, const unsigned int pl4_mw)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -ENODEV;
+	if (pl4_mw > POWER_LIMIT_MAX_VALUE_IN_MW)
+		return -EINVAL;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const unsigned int units = watts_to_units(pl4_mw);
+	uint64_t rapl_pl4 = readq(rapl_mmio_private->rapl_mmio_base + RAPL_PL4_OFFSET);
+
+	rapl_pl4 &= ~RAPL_PL4_MASK;
+	rapl_pl4 |= (units & RAPL_PL4_MASK) | RAPL_PL4_ENABLE | RAPL_PL4_LOCK;
+	writeq(rapl_pl4, rapl_mmio_private->rapl_mmio_base + RAPL_PL4_OFFSET);
+	return 0;
+}
+
+int legion_set_and_lock(struct legion_rapl_mmio_private *rapl_mmio_private,
+			const unsigned int pl1_mw, const unsigned int pl2_mw)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -EINVAL;
+	if (pl1_mw > POWER_LIMIT_MAX_VALUE_IN_MW || pl2_mw > POWER_LIMIT_MAX_VALUE_IN_MW)
+		return -EINVAL;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const unsigned int pl1_units = watts_to_units(pl1_mw);
+	const unsigned int pl2_units = watts_to_units(pl2_mw);
+	uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+
+	rapl_limit &= ~(RAPL_PL1_MASK | RAPL_PL2_MASK);
+	rapl_limit |= (pl1_units & RAPL_PL1_MASK);
+	rapl_limit |= ((uint64_t)pl2_units << RAPL_PL2_SHIFT) & RAPL_PL2_MASK;
+	rapl_limit |= (RAPL_PL1_ENABLE | RAPL_PL2_ENABLE | RAPL_LOCK_BIT);
+	writeq(rapl_limit, rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	return 0;
+}
+
+int legion_set_power_and_time_lock(struct legion_rapl_mmio_private *rapl_mmio_private,
+				   const unsigned int pl1_mw, const unsigned int pl1_time_us,
+				   const unsigned int pl2_mw, const unsigned int pl2_time_us)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -EINVAL;
+	if (pl1_mw > POWER_LIMIT_MAX_VALUE_IN_MW || pl2_mw > POWER_LIMIT_MAX_VALUE_IN_MW)
+		return -EINVAL;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const unsigned int pl1_units = watts_to_units(pl1_mw);
+	const unsigned int pl2_units = watts_to_units(pl2_mw);
+	const unsigned int pl1_time_enc = encode_time_window(pl1_time_us);
+	const unsigned int pl2_time_enc = encode_time_window(pl2_time_us);
+	uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+
+	rapl_limit &= ~(RAPL_PL1_MASK | RAPL_PL2_MASK | RAPL_PL1_TIME_MASK | RAPL_PL2_TIME_MASK);
+	rapl_limit |= (pl1_units & RAPL_PL1_MASK);
+	rapl_limit |= ((uint64_t)pl2_units << RAPL_PL2_SHIFT) & RAPL_PL2_MASK;
+	rapl_limit |= ((uint64_t)pl1_time_enc << RAPL_PL1_TIME_SHIFT) & RAPL_PL1_TIME_MASK;
+	rapl_limit |= ((uint64_t)pl2_time_enc << RAPL_PL2_TIME_SHIFT) & RAPL_PL2_TIME_MASK;
+	rapl_limit |= (RAPL_PL1_ENABLE | RAPL_PL2_ENABLE | RAPL_LOCK_BIT);
+	writeq(rapl_limit, rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	return 0;
+}
+
+int legion_set_power(struct legion_rapl_mmio_private *rapl_mmio_private,
+		     const unsigned int pl1_mw, const unsigned int pl2_mw)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -EINVAL;
+	if (pl1_mw > POWER_LIMIT_MAX_VALUE_IN_MW || pl2_mw > POWER_LIMIT_MAX_VALUE_IN_MW)
+		return -EINVAL;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const unsigned int pl1_units = watts_to_units(pl1_mw);
+	const unsigned int pl2_units = watts_to_units(pl2_mw);
+	uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+
+	rapl_limit &= ~(RAPL_PL1_MASK | RAPL_PL2_MASK);
+	rapl_limit |= (pl1_units & RAPL_PL1_MASK);
+	rapl_limit |= ((uint64_t)pl2_units << RAPL_PL2_SHIFT) & RAPL_PL2_MASK;
+	rapl_limit |= (RAPL_PL1_ENABLE | RAPL_PL2_ENABLE);
+	writeq(rapl_limit, rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	return 0;
+}
+
+int legion_set_power_and_time(struct legion_rapl_mmio_private *rapl_mmio_private,
+			      const unsigned int pl1_mw, const unsigned int pl1_time_us,
+			      const unsigned int pl2_mw)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -EINVAL;
+	if (pl1_mw > POWER_LIMIT_MAX_VALUE_IN_MW || pl2_mw > POWER_LIMIT_MAX_VALUE_IN_MW)
+		return -EINVAL;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const unsigned int pl1_units = watts_to_units(pl1_mw);
+	const unsigned int pl2_units = watts_to_units(pl2_mw);
+	const unsigned int pl1_time_enc = encode_time_window(pl1_time_us);
+	uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+
+	rapl_limit &= ~(RAPL_PL1_MASK | RAPL_PL2_MASK | RAPL_PL1_TIME_MASK);
+	rapl_limit |= (pl1_units & RAPL_PL1_MASK);
+	rapl_limit |= ((uint64_t)pl2_units << RAPL_PL2_SHIFT) & RAPL_PL2_MASK;
+	rapl_limit |= ((uint64_t)pl1_time_enc << RAPL_PL1_TIME_SHIFT) & RAPL_PL1_TIME_MASK;
+	rapl_limit |= (RAPL_PL1_ENABLE | RAPL_PL2_ENABLE);
+	writeq(rapl_limit, rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	return 0;
+}
+
+int legion_pl4_set(struct legion_rapl_mmio_private *rapl_mmio_private, const unsigned int pl4_mw)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -ENODEV;
+	if (pl4_mw > POWER_LIMIT_MAX_VALUE_IN_MW)
+		return -EINVAL;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const unsigned int units = watts_to_units(pl4_mw);
+	uint64_t rapl_pl4 = readq(rapl_mmio_private->rapl_mmio_base + RAPL_PL4_OFFSET);
+
+	rapl_pl4 &= ~RAPL_PL4_MASK;
+	rapl_pl4 |= (units & RAPL_PL4_MASK) | RAPL_PL4_ENABLE;
+	writeq(rapl_pl4, rapl_mmio_private->rapl_mmio_base + RAPL_PL4_OFFSET);
+	return 0;
+}
+
+int legion_pl1_power_set(struct legion_rapl_mmio_private *rapl_mmio_private, const unsigned int pl1_mw)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -EINVAL;
+	if (pl1_mw > POWER_LIMIT_MAX_VALUE_IN_MW)
+		return -EINVAL;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const unsigned int pl1_units = watts_to_units(pl1_mw);
+	uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+
+	rapl_limit &= ~RAPL_PL1_MASK;
+	rapl_limit |= (pl1_units & RAPL_PL1_MASK) | RAPL_PL1_ENABLE;
+	writeq(rapl_limit, rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	return 0;
+}
+
+int legion_pl2_power_set(struct legion_rapl_mmio_private *rapl_mmio_private, const unsigned int pl2_mw)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -EINVAL;
+	if (pl2_mw > POWER_LIMIT_MAX_VALUE_IN_MW)
+		return -EINVAL;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const unsigned int pl2_units = watts_to_units(pl2_mw);
+	uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+
+	rapl_limit &= ~RAPL_PL2_MASK;
+	rapl_limit |= (((uint64_t)pl2_units << RAPL_PL2_SHIFT) & RAPL_PL2_MASK) | RAPL_PL2_ENABLE;
+	writeq(rapl_limit, rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	return 0;
+}
+
+int legion_pl1_time_set(struct legion_rapl_mmio_private *rapl_mmio_private, const unsigned int time_us)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -EINVAL;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const unsigned int time_enc = encode_time_window(time_us);
+	uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+
+	rapl_limit &= ~RAPL_PL1_TIME_MASK;
+	rapl_limit |= ((uint64_t)time_enc << RAPL_PL1_TIME_SHIFT) & RAPL_PL1_TIME_MASK;
+	writeq(rapl_limit, rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	return 0;
+}
+
+int legion_pl2_time_set(struct legion_rapl_mmio_private *rapl_mmio_private, const unsigned int time_us)
+{
+	if (!rapl_mmio_private->rapl_mmio_base)
+		return -EINVAL;
+
+	guard(mutex)(&rapl_mmio_private->lock);
+	const unsigned int time_enc = encode_time_window(time_us);
+	uint64_t rapl_limit = readq(rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+
+	rapl_limit &= ~RAPL_PL2_TIME_MASK;
+	rapl_limit |= ((uint64_t)time_enc << RAPL_PL2_TIME_SHIFT) & RAPL_PL2_TIME_MASK;
+	writeq(rapl_limit, rapl_mmio_private->rapl_mmio_base + RAPL_LIMIT_OFFSET);
+	return 0;
+}
+// SPDX-License-Identifier: GPL-2.0
+#ifndef LEGION_RAPL_MMIO_H_
+#define LEGION_RAPL_MMIO_H_
+
+#include <linux/io.h>
+#include <linux/pci.h>
+#include <linux/mutex.h>
+
+#define POWER_LIMIT_MAX_VALUE_IN_MW 999000
+
+struct legion_rapl_mmio_private {
+	void __iomem *rapl_mmio_base;
+	struct pci_dev *thermal_dev;
+	resource_size_t bar_start;
+	resource_size_t bar_len;
+	struct mutex lock;
+};
+
+int  legion_rapl_mmio_init(const struct device *parent);
+void legion_rapl_mmio_exit(const struct device *parent);
+
+int  legion_pl1_power_read(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int *pl1);
+int  legion_pl2_power_read(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int *pl2);
+int  legion_pl4_power_read(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int *pl4);
+
+int  legion_pl1_time_read(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int *time_us);
+int  legion_pl2_time_read(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int *time_us);
+
+int  legion_is_locked_power_read(struct legion_rapl_mmio_private *rapl_mmio_private, bool *isLocked);
+int  legion_pl4_lock_read(struct legion_rapl_mmio_private *rapl_mmio_private, bool *isLocked);
+
+int  legion_lock_current_mmio(struct legion_rapl_mmio_private *rapl_mmio_private);
+int  legion_set_and_lock(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int pl1_mw, unsigned int pl2_mw);
+int  legion_pl4_set_and_lock(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int pl4_mw);
+int  legion_set_power_and_time_lock(struct legion_rapl_mmio_private *rapl_mmio_private,
+				    unsigned int pl1_mw, unsigned int pl1_time_us,
+				    unsigned int pl2_mw, unsigned int pl2_time_us);
+
+int  legion_set_power(struct legion_rapl_mmio_private *rapl_mmio_private,
+		      unsigned int pl1_mw, unsigned int pl2_mw);
+int  legion_set_power_and_time(struct legion_rapl_mmio_private *rapl_mmio_private,
+			       unsigned int pl1_mw, unsigned int pl1_time_us,
+			       unsigned int pl2_mw);
+int  legion_pl4_set(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int pl4_mw);
+
+int  legion_pl1_power_set(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int pl1_mw);
+int  legion_pl2_power_set(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int pl2_mw);
+int  legion_pl1_time_set(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int time_us);
+int  legion_pl2_time_set(struct legion_rapl_mmio_private *rapl_mmio_private, unsigned int time_us);
+
+#endif /* LEGION_RAPL_MMIO_H_ */
+[Unit]
+Description=Universal Intel MSR, Ratio & RAPL MMIO Tuning
+# Make sure sysfs is fully mounted, modules are loaded, and resume has completed
+After=sysfs.mount systemd-modules-load.service multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/legion-tune-settings.sh
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+#!/bin/bash
+
+MSR_PATH="/sys/class/legion-intel-msr/intel-msr-0"
+RAPL_MSR_PATH="/sys/class/powercap/intel-rapl:0"
+RAPL_MMIO_PATH="/sys/class/powercap/intel-rapl-mmio:0"
+
+# 1. Wait for the DKMS module to initialize the sysfs path (up to 10 seconds)
+for i in {1..10}; do
+    if [ -d "$MSR_PATH" ]; then
+        break
+    fi
+    sleep 1
+done
+
+# If the path still doesn't exist, exit safely
+if [ ! -d "$MSR_PATH" ]; then
+    echo "Error: legion-intel-msr sysfs path not found."
+    exit 1
+fi
+
+# 2. Dynamically sync OS MSR power limits (intel-rapl:0) to MMIO (intel-rapl-mmio:0) and lock
+if [ -d "$RAPL_MSR_PATH" ] && [ -d "$RAPL_MMIO_PATH" ]; then
+    MSR_PL1_UW=$(cat "$RAPL_MSR_PATH/constraint_0_power_limit_uw" 2>/dev/null)
+    MSR_PL2_UW=$(cat "$RAPL_MSR_PATH/constraint_1_power_limit_uw" 2>/dev/null)
+
+    if [ -n "$MSR_PL1_UW" ] && [ -n "$MSR_PL2_UW" ]; then
+        echo "$MSR_PL1_UW" > "$RAPL_MMIO_PATH/constraint_0_power_limit_uw" 2>/dev/null || true
+        echo "$MSR_PL2_UW" > "$RAPL_MMIO_PATH/constraint_1_power_limit_uw" 2>/dev/null || true
+    fi
+fi
+
+# Lock MMIO to the current MSR values so the EC cannot reset it to 30W
+if [ -w "$MSR_PATH/mmio_lock" ]; then
+    echo 1 > "$MSR_PATH/mmio_lock"
+fi
+
+# 3. Apply -55mV Undervolt to Cache, CPU, and iGPU
+echo "-55" > "$MSR_PATH/cache_offset"
+echo "-55" > "$MSR_PATH/cpu_offset"
+echo "-55" > "$MSR_PATH/gpu_offset"
+
+# 4. P-core & E-core Active Ratio Tables
+# P-core Active Table: 1c 2c 3c 4c 5c 6c 7c 8c
+# E-core Active Table: 1c 2c 3c 4c 6c 8c 12c 16c 
+echo "52 50 48 47 46 46 46 44" > "$MSR_PATH/pcore_active_ratios"
+echo "46 46 46 46 44 42 40 40" > "$MSR_PATH/ecore_active_ratios"
+
+sleep 5
+
+## Set P-cores (0-7) to ~4.6 GHz
+#    for i in {0..7}; do
+#        echo "$i 46" > "$MSR_PATH/core_ratio_limit"
+#    done
+## Set E-cores (8-23) to ~3.8 GHz
+#    for i in {8..23}; do
+#        echo "$i 38" > "$MSR_PATH/core_ratio_limit"
+#    done
+
+echo "========================================"
+echo "   LEGION TUNING APPLIED SUCCESSFULLY   "
+echo "========================================"
+echo "--- Power Limits ---"
+echo -n "MSR PL1 (µW):  "; cat "$RAPL_MSR_PATH/constraint_0_power_limit_uw" 2>/dev/null || echo "N/A"
+echo -n "MMIO PL1 (µW): "; cat "$RAPL_MMIO_PATH/constraint_0_power_limit_uw" 2>/dev/null || echo "N/A"
+echo -n "MSR PL2 (µW):  "; cat "$RAPL_MSR_PATH/constraint_1_power_limit_uw" 2>/dev/null || echo "N/A"
+echo -n "MMIO PL2 (µW): "; cat "$RAPL_MMIO_PATH/constraint_1_power_limit_uw" 2>/dev/null || echo "N/A"
+echo -n "MMIO Locked:   "; cat "$MSR_PATH/mmio_lock"
+echo ""
+echo "--- Undervolt Offsets ---"
+echo -n "CPU Offset:    "; cat "$MSR_PATH/cpu_offset"
+echo -n "Cache Offset:  "; cat "$MSR_PATH/cache_offset"
+echo -n "GPU Offset:    "; cat "$MSR_PATH/gpu_offset"
+echo ""
+echo "--- P-core Active Table ---"
+echo -n "1c 2c 3c 4c 5c 6c 7c 8c:     "; cat "$MSR_PATH/pcore_active_ratios"
+echo "--- E-core Active Table ---"
+echo -n "1c 2c 3c 4c 6c 8c 12c 16c:   "; cat "$MSR_PATH/ecore_active_ratios"
+echo ""
+echo "--- Core Ratio Limits ---"
+cat "$MSR_PATH/core_ratio_limit"
+echo "========================================"
+lenovo_legion
+options lenovo_legion lock_mmio=0
+SHELL := /bin/bash
+KERNEL_VERSION ?= $(shell uname --kernel-release)
+KSRC := /lib/modules/$(KERNEL_VERSION)/build
+VERSION := 2.0.0
+
+INSTALL_DIR := /lib/modules/$(KERNEL_VERSION)/kernel/drivers/platform/x86
+MODDEST_DIR := /lib/modules/$(KERNEL_VERSION)/kernel/drivers/platform/x86
+DKMS_DIR := /usr/src/LenovoLegion-$(VERSION)
+
+obj-m := lenovo_legion.o
+lenovo_legion-objs := legion-dkms.o \
+                      legion-rapl-mmio.o \
+                      legion-intel-msr.o \
+                      legion-intel-msr-sysfs.o
+
+all:
+	$(MAKE) -C $(KSRC) M=$(shell pwd) modules
+
+allWarn:
+	$(MAKE) -C $(KSRC) M=$(shell pwd) KCFLAGS=-W modules
+
+clean:
+	$(MAKE) -C $(KSRC) M=$(shell pwd) clean
+
+install: all
+	@rm --force --verbose $(INSTALL_DIR)/lenovo_legion.ko
+	@mkdir --parent --verbose $(MODDEST_DIR)
+	@install --preserve-timestamps -D --mode=644 *.ko $(INSTALL_DIR)
+	@depmod --all $(KERNEL_VERSION)
+	@printf "%s\n" "Installation finished."
+
+uninstall:
+	@rm -f $(INSTALL_DIR)/lenovo_legion.ko
+	@depmod --all
+	@printf "%s\n" "Uninstall finished."
+
+dkms: clean
+	dkms remove -m LenovoLegion -v $(VERSION) --all 2>/dev/null || true
+	rm -rf $(DKMS_DIR)
+	mkdir -p $(DKMS_DIR)
+	cp -R . $(DKMS_DIR)/
+	dkms add -m LenovoLegion -v $(VERSION)
+	dkms build -m LenovoLegion -v $(VERSION) --force
+	dkms install -m LenovoLegion -v $(VERSION) --force
+	modprobe -r lenovo_legion 2>/dev/null || true
+	modprobe lenovo_legion
+
+uninstall-dkms:
+	dkms remove -m LenovoLegion -v $(VERSION) --all 2>/dev/null || true
+	rm -rf $(DKMS_DIR)
+The Lenovo EC (Embedded Controller) clamps the CPU to 30W on Linux because it expects a Windows DTT handshake.
+This is a stripped-down, bloat-free extraction of the lenovo_legion DKMS module that translates the ACPI WMI calls, unblocking the CPU limit natively.
+
+Active Features of Module:
+
+    Hardware Power Limit Unlocking (RAPL & MMIO Synchronization)
+
+        The Lenovo EC natively expects a Windows Dynamic Tuning Technology (DTT) handshake. Without it, the EC aggressively clamps the CPU to ~30W via MMIO limits.
+    
+        The module hooks into the intel-rapl subsystem and syncs the standard MSR limits (PL1/PL2) into the thermal BAR MMIO registers (0x59A0, 0x59B0), effectively tricking the EC and restoring full wattage.
+    (Optional)
+        The module has a custom boot parameter (lock_mmio=Y) to permanently lock the MMIO registers to the MSR limits on boot.
+            Sets bit 63 to 1. This means if you lock the power limits at maximum wattage during boot, and later decide you want to switch to a low-power "Quiet Mode" to save battery, you won't be able to lower the MMIO limits until you restart the system.
+                Method: Modprobe Config
+                This method tells the kernel's module manager to always append the parameter whenever lenovo_legion is loaded.
+                Open your terminal and locate the configuration file in /etc/modprobe.d/lenovo-legion-lock_mmio.conf
+                Add the following single line to the file:
+                options lenovo_legion lock_mmio=1
+
+    Intel MSR Voltage Control (Undervolting/Overvolting)
+
+        Exposes deep sysfs controls to apply voltage offsets (undervolting) across 5 distinct planes: CPU Core, GPU, Cache, Uncore, and AnalogIO.
+
+    Hardware Monitoring (hwmon)
+
+        Exposes native sensors to Linux hwmon for CPU, GPU, and System temperatures, as well as current and maximum Fan RPMs.
+
+    Lenovo Custom Fan Curves (WMI FM & FTable)
+
+        Directly translates Lenovo's proprietary WMI Fan Methods (FM) to allow reading and writing of custom 10-point fan curve tables to the EC.
+
+    WMI Gamezone & Thermal Profiles
+
+        Event listening (like pressing Fn+Q) is handled by the standard Linux ACPI driver "ideapad_laptop", but this module still actively manages the backend states. It reads and applies Lenovo's Quiet, Balanced, Performance, and Custom thermal modes directly to the hardware.
+
+    Extended EC Capabilities (WMI Other / CapData)
+
+        Exposes toggles for advanced hardware features via sysfs, including iGPU mode switching (Auto/iGPU only), OverDrive (display overdrive), USB charging features, GPU overclocks, and touchpad disabling.
